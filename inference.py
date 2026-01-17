@@ -1,30 +1,20 @@
 import os
 
-def scan_disk():
-    print(f"{'PATH':<60} | {'SIZE'}")
-    print("-" * 75)
+target = "/app/data"
+cwd = os.getcwd()
 
-    # Folders to ignore (Standard Linux system files)
-    # We skip these to find your actual data faster
-    ignore_dirs = {
-        'proc', 'sys', 'dev', 'lib', 'usr', 'bin', 
-        'sbin', 'boot', 'run', 'tmp', 'etc', 'var'
-    }
+print(f"1. Python is running from: {cwd}")
+print(f"2. Checking absolute path '{target}'...")
 
-    # Walk through the entire directory tree starting at root
-    for root, dirs, files in os.walk("/"):
-        # Modify dirs in-place to stop os.walk from entering system folders
-        dirs[:] = [d for d in dirs if d not in ignore_dirs]
-        
-        for name in files:
-            filepath = os.path.join(root, name)
-            try:
-                # Get file size to help identify database files or large uploads
-                size = os.path.getsize(filepath)
-                print(f"{filepath:<60} | {size} bytes")
-            except OSError:
-                # specific permissions error, skip
-                pass
-
-if __name__ == "__main__":
-    scan_disk()
+if os.path.exists(target):
+    contents = os.listdir(target)
+    print(f"   STATUS: Found! It contains {len(contents)} items.")
+    print(f"   CONTENTS: {contents}")
+    
+    # Check if we can actually read it (Permissions check)
+    if os.access(target, os.R_OK):
+        print("   PERMISSIONS: Read access OK.")
+    else:
+        print("   PERMISSIONS: BLOCKED (Cannot read). Needs root.")
+else:
+    print("   STATUS: NOT FOUND. The folder does not exist at this path.")
