@@ -1,20 +1,13 @@
 import os
 
-target = "/app/data"
-cwd = os.getcwd()
+# Define the path
+path = "/app/data/"
 
-print(f"1. Python is running from: {cwd}")
-print(f"2. Checking absolute path '{target}'...")
-
-if os.path.exists(target):
-    contents = os.listdir(target)
-    print(f"   STATUS: Found! It contains {len(contents)} items.")
-    print(f"   CONTENTS: {contents}")
-    
-    # Check if we can actually read it (Permissions check)
-    if os.access(target, os.R_OK):
-        print("   PERMISSIONS: Read access OK.")
-    else:
-        print("   PERMISSIONS: BLOCKED (Cannot read). Needs root.")
-else:
-    print("   STATUS: NOT FOUND. The folder does not exist at this path.")
+try:
+    # exist_ok=True prevents an error if the folder already exists
+    os.makedirs(path, exist_ok=True)
+    print(f"Successfully ensured directory exists at: {path}")
+except PermissionError:
+    print("Error: You do not have permission to create this directory.")
+except Exception as e:
+    print(f"An error occurred: {e}")
