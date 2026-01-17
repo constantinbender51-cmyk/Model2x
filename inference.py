@@ -5,11 +5,11 @@ import time
 import pandas as pd
 import numpy as np
 import ccxt
-from datetime import datetime
+from datetime import datetime, timezone
 from collections import Counter
 from huggingface_hub import hf_hub_download
 
-# --- CONFIGURATION ---pee
+# --- CONFIGURATION ---
 SYMBOL = 'ETH/USDT'
 TIMEFRAME = '30m'
 START_DATE = '2020-01-01T00:00:00Z'
@@ -83,7 +83,6 @@ def download_model():
         sys.exit(1)
 
 def get_grid_indices(df, step_size):
-    # Standard training logic (cumprod)
     close_array = df['close'].to_numpy()
     pct_change = np.zeros(len(close_array))
     pct_change[1:] = np.diff(close_array) / close_array[:-1]
@@ -102,7 +101,6 @@ def run_inference(df, model_path):
     idx_80 = int(total_len * 0.80)
     idx_90 = int(total_len * 0.90)
     
-    # Pre-calc grids
     config_grids = []
     for cfg in configs:
         grid = get_grid_indices(df, cfg['step_size'])
@@ -163,54 +161,53 @@ def run_inference(df, model_path):
     accuracy = (correct / total_trades * 100) if total_trades > 0 else 0.0
     return accuracy, total_trades
 
-def run_live_prediction(anchor_price, model_path):
+def run_live_prediction(anchor_price, model_data):
+    """
+    Runs a single prediction based on the most recently closed candle.
+    Accepts loaded model_data to avoid reloading pickle every 30m.
+    """
     print(f"\n{'='*40}")
-    print(f"LIVE PREDICTION (ETH/USDT)")
+    print(f"LIVE PREDICTION (ETH/USDT) - {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print(f"{'='*40}")
     
-    # 1. Load Model
-    with open(model_path, 'rb') as f:
-        model_data = pickle.load(f)
     configs = model_data['ensemble_configs']
     
-    # 2. Fetch Latest Data (Small batch only)
-    print(f"[LIVE] Anchor Price (Jan 2020): {anchor_price:.2f}")
-    print("[LIVE] Fetching last 50 candles...")
+    # Fetch Data
     exchange = ccxt.binance({'enableRateLimit': True})
-    live_ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=50)
-    
-    if not live_ohlcv:
-        print("[ERROR] Could not fetch live data.")
+    try:
+        live_ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=50)
+    except Exception as e:
+        print(f"[ERROR] Could not fetch live data: {e}")
         return
 
-    # Process: DataFrame -> Remove unfinished -> Last 10
+    if not live_ohlcv:
+        print("[ERROR] No data returned from exchange.")
+        return
+
     live_df = pd.DataFrame(live_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     live_df['timestamp'] = pd.to_datetime(live_df['timestamp'], unit='ms', utc=True)
-    live_df = live_df.iloc[:-1] # Drop unfinished
     
-    # 3. DIRECT CALCULATION (No stitching)
-    # Formula: floor( log(Price_t / Anchor) / step )
+    # IMPORTANT: Drop the last row as it is the currently forming (unfinished) candle
+    # We predict based on the 'close' of the previous completed candle.
+    live_df = live_df.iloc[:-1] 
+    
     prices = live_df['close'].to_numpy()
     log_prices = np.log(prices / anchor_price)
     
-    print("\n--- Last 5 Finished Candles ---")
-    print(live_df.tail(5)[['timestamp', 'close']].to_string(index=False))
-    print("--------------------------------")
+    last_candle_time = live_df.iloc[-1]['timestamp']
+    print(f"Latest CLOSED Candle: {last_candle_time} | Price: {prices[-1]:.2f}")
 
     up_votes = 0
     down_votes = 0
     
-    print("\n[LIVE] Computing votes...")
     for cfg in configs:
         step_size = cfg['step_size']
         seq_len = cfg['seq_len']
         
-        # Calculate grid indices directly
         grid = np.floor(log_prices / step_size).astype(int)
         
         if len(grid) < seq_len: continue
             
-        # Extract sequence (last seq_len candles)
         current_seq_tuple = tuple(grid[-seq_len:])
         current_level = current_seq_tuple[-1]
         
@@ -231,18 +228,56 @@ def run_live_prediction(anchor_price, model_path):
         print(f"\n>>> PREDICTION: NEUTRAL ⚪")
     print(f"{'='*40}\n")
 
+def start_live_bot_loop(anchor_price, model_path):
+    print(f"\n[SYSTEM] Initializing Live Bot Loop...")
+    
+    # Load model once to save IO
+    with open(model_path, 'rb') as f:
+        model_data = pickle.load(f)
+        
+    print(f"[SYSTEM] Model loaded. Anchor Price: {anchor_price:.2f}")
+    
+    while True:
+        try:
+            # 1. Run the Prediction
+            run_live_prediction(anchor_price, model_data)
+            
+            # 2. Calculate Sleep Time until next 30m candle close
+            # Candles close at :00 and :30
+            now = time.time()
+            interval = 30 * 60 # 1800 seconds
+            
+            # Calculate next interval timestamp
+            next_timestamp = ((now // interval) + 1) * interval
+            
+            # Sleep until next timestamp + 10 seconds buffer (to let API index the candle)
+            sleep_duration = next_timestamp - now + 10
+            
+            next_run_dt = datetime.fromtimestamp(next_timestamp + 10)
+            print(f"[WAIT] Sleeping {sleep_duration/60:.2f} minutes.")
+            print(f"[WAIT] Next run scheduled for: {next_run_dt.strftime('%H:%M:%S')}")
+            
+            time.sleep(sleep_duration)
+            
+        except KeyboardInterrupt:
+            print("\n[STOP] Bot stopped by user.")
+            break
+        except Exception as e:
+            print(f"\n[ERROR] Unexpected error in loop: {e}")
+            print("Retrying in 60 seconds...")
+            time.sleep(60)
+
 def main():
-    # 1. Fetch/Load History
+    # 1. Fetch/Load History to get Anchor Price
     df = fetch_or_load_data()
     if df.empty: sys.exit(1)
         
-    # ** KEY STEP: Get Anchor Price **
     anchor_price = df['close'].iloc[0]
 
     # 2. Download Model
     model_path = download_model()
 
-    # 3. Validation (Backtest)
+    # 3. Validation (Backtest) - Only runs once on startup
     acc, trades = run_inference(df, model_path)
     
     print(f"\nAccuracy: {acc:.2f}% | Trades: {trades}")
@@ -251,8 +286,8 @@ def main():
     else:
         print("STATUS: FAIL ❌")
         
-    # 4. Live Prediction (Optimized)
-    run_live_prediction(anchor_price, model_path)
+    # 4. Start the Continuous Loop
+    start_live_bot_loop(anchor_price, model_path)
 
 if __name__ == "__main__":
     main()
