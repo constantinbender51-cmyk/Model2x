@@ -8,17 +8,14 @@ from datetime import datetime
 from collections import Counter
 
 # --- CONFIGURATION ---
-MODEL_FILENAME = "/app/data/eth.pkl"  # Updated Path
+MODEL_FILENAME = "/app/data/eth.pkl"
 SYMBOL = 'ETH/USDT'
 TIMEFRAME = '30m'
+# Ensure dates match the training period to maintain the 80/90 split logic
 START_DATE = '2020-01-01T00:00:00Z'
 END_DATE = '2026-01-01T00:00:00Z'
-SEQ_LENGTH = 5
 
 def fetch_binance_data(symbol=SYMBOL, timeframe=TIMEFRAME, start_date=START_DATE, end_date=END_DATE):
-    """
-    Fetches historical OHLCV data from Binance.
-    """
     print(f"--- Fetching Data for {symbol} ---")
     exchange = ccxt.binance({'enableRateLimit': True})
     since = exchange.parse8601(start_date)
@@ -43,127 +40,102 @@ def fetch_binance_data(symbol=SYMBOL, timeframe=TIMEFRAME, start_date=START_DATE
 
     df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
-    
-    # Filter exact date range
-    start_dt = pd.Timestamp(start_date, tz='UTC')
-    end_dt = pd.Timestamp(end_date, tz='UTC')
-    return df.loc[(df['timestamp'] >= start_dt) & (df['timestamp'] < end_dt)].reset_index(drop=True)
+    return df.reset_index(drop=True)
 
 def get_grid_indices(df, step_size):
-    """
-    Converts price series into grid indices based on log-price steps.
-    """
     close_array = df['close'].to_numpy()
-    # Calculate percentage changes to reconstruct the relative path
     pct_change = np.zeros(len(close_array))
     pct_change[1:] = np.diff(close_array) / close_array[:-1]
-    
-    # Reconstruct absolute price path (normalized)
     multipliers = 1.0 + pct_change
     abs_price_raw = np.cumprod(multipliers)
     abs_price_log = np.log(abs_price_raw)
-    
-    # Quantize to grid
-    grid_indices = np.floor(abs_price_log / step_size).astype(int)
-    return grid_indices
+    return np.floor(abs_price_log / step_size).astype(int)
 
 def run_inference():
     # 1. Load Model
     try:
         with open(MODEL_FILENAME, 'rb') as f:
             model_data = pickle.load(f)
-        print(f"\n[LOADED] Model from {MODEL_FILENAME}")
-        print(f"Timestamp: {model_data.get('timestamp', 'Unknown')}")
-        print(f"Ensemble Size: {len(model_data['ensemble_configs'])} configurations")
-    except FileNotFoundError:
-        print(f"[ERROR] {MODEL_FILENAME} not found. Please ensure the model file exists.")
-        sys.exit(1)
+        print(f"\n[LOADED] Model: {MODEL_FILENAME}")
+        print(f"Created: {model_data.get('timestamp')}")
+        print(f"Ensemble Size: {len(model_data['ensemble_configs'])} configs")
     except Exception as e:
-        print(f"[ERROR] Could not load model: {e}")
+        print(f"[ERROR] Model loading failed: {e}")
         sys.exit(1)
 
     # 2. Fetch Data
     df = fetch_binance_data()
-    if df.empty:
-        print("[ERROR] No data fetched.")
-        sys.exit(1)
+    if df.empty: sys.exit(1)
 
-    # 3. Define the Test Range (80% -> 90%)
+    # 3. Define Validation Range (80% -> 90%)
     total_len = len(df)
     idx_80 = int(total_len * 0.80)
     idx_90 = int(total_len * 0.90)
     
     print(f"\n--- TESTING ON RANGE 80%-90% ---")
-    print(f"Data Indices: {idx_80} to {idx_90}")
     print(f"Time Range: {df['timestamp'].iloc[idx_80]} -> {df['timestamp'].iloc[idx_90]}")
 
     ensemble_configs = model_data['ensemble_configs']
     
-    # Store the sliced grid sequences for the test period
-    test_sequences = []
-    
+    # Pre-calculate grid sequences for each config in the ensemble
+    processed_configs = []
     for cfg in ensemble_configs:
         full_grid = get_grid_indices(df, cfg['step_size'])
-        # Extract the validation slice
-        val_slice = full_grid[idx_80:idx_90]
-        
-        test_sequences.append({
+        processed_configs.append({
             'cfg': cfg,
-            'sequence': val_slice
+            'val_slice': full_grid[idx_80:idx_90]
         })
 
-    # 4. Run Ensemble Prediction
+    # 4. Simulation Logic
+    # We must find the max sequence length to know where to safely start
+    max_s_len = max(cfg['seq_len'] for cfg in ensemble_configs)
     slice_len = idx_90 - idx_80
     
     combined_correct = 0
     combined_total = 0
     
-    print("\nRunning simulation...")
+    print(f"Running simulation (Starting at offset {max_s_len})...")
     
-    for i in range(slice_len - SEQ_LENGTH):
+    # Iterate through time by TARGET index
+    for target_idx in range(max_s_len, slice_len):
         up_votes = []
         down_votes = []
         
-        # Check every model in the ensemble
-        for item in test_sequences:
+        for item in processed_configs:
             cfg = item['cfg']
-            seq_data = item['sequence']
+            val_seq = item['val_slice']
+            s_len = cfg['seq_len']
             
-            # Current pattern
-            current_seq_tuple = tuple(seq_data[i : i + SEQ_LENGTH])
-            current_level = current_seq_tuple[-1]
+            # Extract sequence ending just before target_idx
+            current_seq = tuple(val_seq[target_idx - s_len : target_idx])
+            current_level = current_seq[-1]
             
-            # Check if this pattern exists in the trained memory
-            if current_seq_tuple in cfg['patterns']:
-                history = cfg['patterns'][current_seq_tuple]
-                # Predict next move based on history
-                predicted_next = Counter(history).most_common(1)[0][0]
-                diff = predicted_next - current_level
+            if current_seq in cfg['patterns']:
+                history = cfg['patterns'][current_seq]
+                predicted_level = Counter(history).most_common(1)[0][0]
+                diff = predicted_level - current_level
                 
-                if diff > 0:
-                    up_votes.append(item)
-                elif diff < 0:
-                    down_votes.append(item)
+                if diff > 0: up_votes.append(item)
+                elif diff < 0: down_votes.append(item)
         
-        # 5. Ensemble Decision Logic (Consensus)
+        # 5. Ensemble Voting (Unanimity logic from training script)
+        decision = "HOLD"
+        voters = []
+        
         if len(up_votes) > 0 and len(down_votes) == 0:
             decision = "UP"
             voters = up_votes
         elif len(down_votes) > 0 and len(up_votes) == 0:
             decision = "DOWN"
             voters = down_votes
-        else:
-            decision = "HOLD"
             
-        # 6. Verify against Reality
+        # 6. Verification
         if decision != "HOLD":
+            # Select the config with the largest step_size for verification (per training logic)
             best_voter = max(voters, key=lambda x: x['cfg']['step_size'])
-            best_seq = best_voter['sequence']
+            best_seq = best_voter['val_slice']
             
-            curr_lvl = best_seq[i + SEQ_LENGTH - 1] # The last known point
-            next_lvl = best_seq[i + SEQ_LENGTH]     # The actual next point
-            
-            actual_diff = next_lvl - curr_lvl
+            actual_diff = best_seq[target_idx] - best_seq[target_idx - 1]
             
             if actual_diff != 0:
                 combined_total += 1
@@ -172,19 +144,10 @@ def run_inference():
 
     # 7. Final Results
     acc = (combined_correct / combined_total * 100) if combined_total > 0 else 0.0
-    
-    print("-" * 30)
-    print(f"RESULTS FOR VALIDATION SLICE (80-90%)")
-    print("-" * 30)
-    print(f"Total Trades Taken: {combined_total}")
-    print(f"Correct Trades:     {combined_correct}")
-    print(f"Accuracy:           {acc:.2f}%")
-    print("-" * 30)
-    
-    if acc > 50.0:
-        print(">>> SUCCESS <<<")
-    else:
-        print(">>> FAILURE <<<")
+    print("-" * 35)
+    print(f"Total Trades: {combined_total}")
+    print(f"Accuracy:     {acc:.2f}%")
+    print("-" * 35)
 
 if __name__ == "__main__":
     run_inference()
