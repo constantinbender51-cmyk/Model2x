@@ -1,25 +1,30 @@
 import os
 
-def scan_directory(start_path='/'):
-    print(f"--- Scanning for files starting from: {start_path} ---")
-    try:
-        # Walk through the directory tree
-        for root, dirs, files in os.walk(start_path):
-            # Skip hidden directories like .git or system dirs to keep output clean
-            dirs[:] = [d for d in dirs if not d.startswith('.')]
-            
-            for file in files:
-                # Construct absolute path
-                full_path = os.path.join(root, file)
-                print(full_path)
-                
-    except PermissionError:
-        print(f"Permission denied for {start_path}")
-    except Exception as e:
-        print(f"Error: {e}")
+def scan_disk():
+    print(f"{'PATH':<60} | {'SIZE'}")
+    print("-" * 75)
+
+    # Folders to ignore (Standard Linux system files)
+    # We skip these to find your actual data faster
+    ignore_dirs = {
+        'proc', 'sys', 'dev', 'lib', 'usr', 'bin', 
+        'sbin', 'boot', 'run', 'tmp', 'etc', 'var'
+    }
+
+    # Walk through the entire directory tree starting at root
+    for root, dirs, files in os.walk("/"):
+        # Modify dirs in-place to stop os.walk from entering system folders
+        dirs[:] = [d for d in dirs if d not in ignore_dirs]
+        
+        for name in files:
+            filepath = os.path.join(root, name)
+            try:
+                # Get file size to help identify database files or large uploads
+                size = os.path.getsize(filepath)
+                print(f"{filepath:<60} | {size} bytes")
+            except OSError:
+                # specific permissions error, skip
+                pass
 
 if __name__ == "__main__":
-    # Start scanning from the current directory, or change to '/' to scan the entire container
-    scan_directory('.') 
-    # If you want to scan the app folder specifically, uncomment below:
-    # scan_directory('/app')
+    scan_disk()
