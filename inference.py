@@ -5,7 +5,8 @@ import time
 import pandas as pd
 import numpy as np
 import ccxt
-from datetime import datetime, timezone
+import psycopg2 
+from datetime import datetime, timezone, timedelta
 from collections import Counter
 from huggingface_hub import hf_hub_download
 
@@ -14,6 +15,10 @@ SYMBOL = 'ETH/USDT'
 TIMEFRAME = '30m'
 START_DATE = '2020-01-01T00:00:00Z'
 END_DATE = '2026-01-01T00:00:00Z'
+
+# Railway / Database Configuration
+# Railway automatically provides this variable in your deployment environment
+DATABASE_URL = os.getenv("DATABASE_URL")
 
 # Paths
 DATA_DIR = "/app/data"
@@ -31,6 +36,71 @@ TRADES_TOLERANCE = 100
 def ensure_directories():
     if not os.path.exists(DATA_DIR):
         os.makedirs(DATA_DIR)
+
+# --- DATABASE FUNCTIONS ---
+
+def get_db_connection():
+    """Establishes connection to the Railway Postgres DB"""
+    if not DATABASE_URL:
+        print("[ERROR] DATABASE_URL environment variable not found.")
+        return None
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        return conn
+    except Exception as e:
+        print(f"[ERROR] Database connection failed: {e}")
+        return None
+
+def init_db():
+    """Creates the signal table if it does not exist"""
+    print("[DB] Initializing database...")
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            # We set asset as PRIMARY KEY to ensure we can overwrite (Upsert) easily
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS signal (
+                    asset TEXT PRIMARY KEY,
+                    prediction TEXT,
+                    start_time TIMESTAMP,
+                    end_time TIMESTAMP
+                );
+            """)
+            conn.commit()
+            cur.close()
+            conn.close()
+            print("[DB] Table 'signal' is ready.")
+        except Exception as e:
+            print(f"[ERROR] Failed to init DB: {e}")
+
+def save_prediction_to_db(asset, prediction, start_time, end_time):
+    """
+    Saves the prediction. 
+    Uses ON CONFLICT to overwrite the existing entry for this specific asset.
+    """
+    conn = get_db_connection()
+    if conn:
+        try:
+            cur = conn.cursor()
+            query = """
+                INSERT INTO signal (asset, prediction, start_time, end_time)
+                VALUES (%s, %s, %s, %s)
+                ON CONFLICT (asset) 
+                DO UPDATE SET 
+                    prediction = EXCLUDED.prediction,
+                    start_time = EXCLUDED.start_time,
+                    end_time = EXCLUDED.end_time;
+            """
+            cur.execute(query, (asset, prediction, start_time, end_time))
+            conn.commit()
+            cur.close()
+            conn.close()
+            print(f"[DB] Saved: {asset} -> {prediction}")
+        except Exception as e:
+            print(f"[ERROR] Failed to save prediction: {e}")
+
+# --- EXISTING LOGIC ---
 
 def fetch_or_load_data():
     ensure_directories()
@@ -163,11 +233,11 @@ def run_inference(df, model_path):
 
 def run_live_prediction(anchor_price, model_data):
     """
-    Runs a single prediction based on the most recently closed candle.
-    Accepts loaded model_data to avoid reloading pickle every 30m.
+    Runs a single prediction and saves it to Postgres.
     """
+    now_utc = datetime.now(timezone.utc)
     print(f"\n{'='*40}")
-    print(f"LIVE PREDICTION (ETH/USDT) - {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}")
+    print(f"LIVE PREDICTION (ETH/USDT) - {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
     print(f"{'='*40}")
     
     configs = model_data['ensemble_configs']
@@ -187,8 +257,7 @@ def run_live_prediction(anchor_price, model_data):
     live_df = pd.DataFrame(live_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     live_df['timestamp'] = pd.to_datetime(live_df['timestamp'], unit='ms', utc=True)
     
-    # IMPORTANT: Drop the last row as it is the currently forming (unfinished) candle
-    # We predict based on the 'close' of the previous completed candle.
+    # Drop unfinished candle
     live_df = live_df.iloc[:-1] 
     
     prices = live_df['close'].to_numpy()
@@ -220,12 +289,30 @@ def run_live_prediction(anchor_price, model_data):
             elif diff < 0: down_votes += 1
     
     print(f"[LIVE] Votes: UP={up_votes}, DOWN={down_votes}, Configs={len(configs)}")
+    
+    # Determine Status
+    pred_status = "NEUTRAL"
     if up_votes > 0 and down_votes == 0:
+        pred_status = "LONG"
         print(f"\n>>> PREDICTION: LONG (UP) 🟢")
     elif down_votes > 0 and up_votes == 0:
+        pred_status = "SHORT"
         print(f"\n>>> PREDICTION: SHORT (DOWN) 🔴")
     else:
         print(f"\n>>> PREDICTION: NEUTRAL ⚪")
+        
+    # Prepare Data for DB
+    # Prediction covers the NEXT 30 minutes
+    start_time = now_utc
+    end_time = now_utc + timedelta(minutes=30)
+    
+    save_prediction_to_db(
+        asset=SYMBOL,
+        prediction=pred_status,
+        start_time=start_time,
+        end_time=end_time
+    )
+
     print(f"{'='*40}\n")
 
 def start_live_bot_loop(anchor_price, model_path):
@@ -239,18 +326,14 @@ def start_live_bot_loop(anchor_price, model_path):
     
     while True:
         try:
-            # 1. Run the Prediction
+            # 1. Run the Prediction & Save to DB
             run_live_prediction(anchor_price, model_data)
             
             # 2. Calculate Sleep Time until next 30m candle close
-            # Candles close at :00 and :30
             now = time.time()
             interval = 30 * 60 # 1800 seconds
             
-            # Calculate next interval timestamp
             next_timestamp = ((now // interval) + 1) * interval
-            
-            # Sleep until next timestamp + 10 seconds buffer (to let API index the candle)
             sleep_duration = next_timestamp - now + 10
             
             next_run_dt = datetime.fromtimestamp(next_timestamp + 10)
@@ -268,6 +351,9 @@ def start_live_bot_loop(anchor_price, model_path):
             time.sleep(60)
 
 def main():
+    # 0. Initialize Database
+    init_db()
+
     # 1. Fetch/Load History to get Anchor Price
     df = fetch_or_load_data()
     if df.empty: sys.exit(1)
