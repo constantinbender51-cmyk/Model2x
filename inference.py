@@ -8,7 +8,7 @@ from datetime import datetime
 from collections import Counter
 
 # --- CONFIGURATION ---
-MODEL_FILENAME = "grid_ensemble_model.pkl"
+MODEL_FILENAME = "/app/data/eth.pkl"  # Updated Path
 SYMBOL = 'ETH/USDT'
 TIMEFRAME = '30m'
 START_DATE = '2020-01-01T00:00:00Z'
@@ -72,10 +72,14 @@ def run_inference():
     try:
         with open(MODEL_FILENAME, 'rb') as f:
             model_data = pickle.load(f)
-        print(f"\n[LOADED] Model from {model_data['timestamp']}")
+        print(f"\n[LOADED] Model from {MODEL_FILENAME}")
+        print(f"Timestamp: {model_data.get('timestamp', 'Unknown')}")
         print(f"Ensemble Size: {len(model_data['ensemble_configs'])} configurations")
     except FileNotFoundError:
-        print(f"[ERROR] {MODEL_FILENAME} not found. Train the model first.")
+        print(f"[ERROR] {MODEL_FILENAME} not found. Please ensure the model file exists.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"[ERROR] Could not load model: {e}")
         sys.exit(1)
 
     # 2. Fetch Data
@@ -85,7 +89,6 @@ def run_inference():
         sys.exit(1)
 
     # 3. Define the Test Range (80% -> 90%)
-    # This matches the "10<- this 10" instruction
     total_len = len(df)
     idx_80 = int(total_len * 0.80)
     idx_90 = int(total_len * 0.90)
@@ -95,9 +98,6 @@ def run_inference():
     print(f"Time Range: {df['timestamp'].iloc[idx_80]} -> {df['timestamp'].iloc[idx_90]}")
 
     ensemble_configs = model_data['ensemble_configs']
-    
-    # We need to calculate the grid indices for EVERY config in the ensemble
-    # because every config uses a different step_size
     
     # Store the sliced grid sequences for the test period
     test_sequences = []
@@ -113,7 +113,6 @@ def run_inference():
         })
 
     # 4. Run Ensemble Prediction
-    # We iterate through the time steps of this slice
     slice_len = idx_90 - idx_80
     
     combined_correct = 0
@@ -147,7 +146,6 @@ def run_inference():
                     down_votes.append(item)
         
         # 5. Ensemble Decision Logic (Consensus)
-        # We only trade if there is a conflict-free consensus (only Up or only Down votes)
         if len(up_votes) > 0 and len(down_votes) == 0:
             decision = "UP"
             voters = up_votes
@@ -159,16 +157,11 @@ def run_inference():
             
         # 6. Verify against Reality
         if decision != "HOLD":
-            # We pick the 'best' config (highest step size usually implies stronger signal magnitude) 
-            # to determine the ground truth movement relative to the grid
-            # OR we can just check if price went up/down generally.
-            # Here we check the grid movement of the best voting config.
-            
             best_voter = max(voters, key=lambda x: x['cfg']['step_size'])
             best_seq = best_voter['sequence']
             
             curr_lvl = best_seq[i + SEQ_LENGTH - 1] # The last known point
-            next_lvl = best_seq[i + SEQ_LENGTH]     # The actual next point (Future)
+            next_lvl = best_seq[i + SEQ_LENGTH]     # The actual next point
             
             actual_diff = next_lvl - curr_lvl
             
