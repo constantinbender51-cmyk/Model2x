@@ -8,7 +8,7 @@ from datetime import datetime
 from collections import Counter
 
 # --- CONFIGURATION ---
-MODEL_FILENAME = "/app/data/eth.pkl"  # Updated Path
+MODEL_FILENAME = "grid_ensemble_model.pkl"  # Corrected Filename
 SYMBOL = 'ETH/USDT'
 TIMEFRAME = '30m'
 START_DATE = '2020-01-01T00:00:00Z'
