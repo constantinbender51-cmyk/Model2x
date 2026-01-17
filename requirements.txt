@@ -1,3 +1,4 @@
+pickle
 ccxt
 pandas
 numpy
