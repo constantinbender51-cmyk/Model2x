@@ -1,3 +1,4 @@
+dotenv
 psycopg2-binary
 ccxt
 pandas
