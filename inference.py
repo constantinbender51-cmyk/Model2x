@@ -21,13 +21,13 @@ DATA_DIR = "/app/data"
 DATA_FILE = os.path.join(DATA_DIR, "ohlcv_data.pkl")
 MODEL_FILENAME = "eth.pkl"
 
-# Hugging Face Config (Repo to download from)
+# Hugging Face Config
 HF_REPO_ID = "Llama26051996/Models" 
 HF_FOLDER = "model2x"
 
 # Pass Criteria
-TARGET_ACCURACY = 85.0  # Approx ~85%
-ACCURACY_TOLERANCE = 5.0 # Allow 80-90 range
+TARGET_ACCURACY = 85.0
+ACCURACY_TOLERANCE = 5.0
 TARGET_TRADES = 1100
 TRADES_TOLERANCE = 100
 
@@ -89,18 +89,11 @@ def download_model():
         model_path = hf_hub_download(
             repo_id=HF_REPO_ID,
             filename=f"{HF_FOLDER}/{MODEL_FILENAME}",
-            local_dir="." # Download to current directory
+            local_dir="." 
         )
-        # Move it to current dir if nested by hf_hub_download logic, 
-        # but usually local_dir handles it. We assume it's accessible.
-        # hf_hub_download might create the folder structure locally.
-        # We need to find the actual file if it placed it in a subdir.
-        
         actual_path = os.path.join(".", HF_FOLDER, MODEL_FILENAME)
         if not os.path.exists(actual_path):
-            # If download flattened it or put it elsewhere, try standard name
             actual_path = model_path
-            
         print(f"[MODEL] Downloaded to: {actual_path}")
         return actual_path
     except Exception as e:
@@ -126,10 +119,6 @@ def run_inference(df, model_path):
     configs = model_data['ensemble_configs']
     print(f"[INFERENCE] Loaded ensemble with {len(configs)} configurations.")
 
-    # --- RECONSTRUCT VALIDATION SET (80% - 90%) ---
-    # We must calculate grid indices for the *whole* DF first to maintain consistency,
-    # then slice the indices, exactly as the training script did.
-    
     total_len = len(df)
     idx_80 = int(total_len * 0.80)
     idx_90 = int(total_len * 0.90)
@@ -137,61 +126,45 @@ def run_inference(df, model_path):
     print(f"[INFERENCE] Total Data: {total_len} rows.")
     print(f"[INFERENCE] Testing on Validation Slice (80%-90%): Indices {idx_80} to {idx_90}")
     
-    # Pre-calculate grid indices for all configs to save time
-    # config_grids[i] = full array of grid indices for config i
     config_grids = []
     for cfg in configs:
         grid = get_grid_indices(df, cfg['step_size'])
-        # Store only the validation slice + lookback buffer
-        # We need enough history before idx_80 to form the first sequence
         max_lookback = cfg['seq_len']
-        # We slice from (idx_80 - max_lookback) to idx_90
         slice_start = idx_80 - max_lookback
         val_slice = grid[slice_start:idx_90]
         config_grids.append({
             'cfg': cfg,
             'val_seq': val_slice, 
-            'offset': slice_start # To map back to relative indices
+            'offset': slice_start 
         })
 
     correct = 0
     total_trades = 0
-    
-    # Iterate through the validation period
-    # We iterate i from 0 to (idx_90 - idx_80). 
-    # The 'target' index in the FULL array is idx_80 + i.
     range_len = idx_90 - idx_80
     
     print(f"[INFERENCE] Running ensemble voting on {range_len} time steps...")
     
     for i in range(range_len):
         target_abs_idx = idx_80 + i
-        
         up_votes = 0
         down_votes = 0
-        
-        valid_voters = [] # To store who voted what for tie-breaking/verification
+        valid_voters = [] 
         
         for grid_data in config_grids:
             cfg = grid_data['cfg']
             val_seq = grid_data['val_seq']
             offset = grid_data['offset']
             seq_len = cfg['seq_len']
-            
-            # The index of the target in our 'val_seq' slice
             local_target_idx = target_abs_idx - offset
             
-            # We need history [local_target_idx - seq_len : local_target_idx]
-            # to predict local_target_idx
             if local_target_idx < seq_len:
-                continue # Not enough data yet (shouldn't happen with our buffer, but safety first)
+                continue 
                 
             current_seq_tuple = tuple(val_seq[local_target_idx - seq_len : local_target_idx])
             current_level = current_seq_tuple[-1]
             
             if current_seq_tuple in cfg['patterns']:
                 history = cfg['patterns'][current_seq_tuple]
-                # Majority Vote
                 predicted_level = Counter(history).most_common(1)[0][0]
                 diff = predicted_level - current_level
                 
@@ -202,22 +175,16 @@ def run_inference(df, model_path):
                     down_votes += 1
                     valid_voters.append(('down', cfg, val_seq, local_target_idx))
 
-        # --- ENSEMBLE LOGIC (UNANIMITY) ---
-        prediction = 0 # 0: None, 1: Long, -1: Short
-        
+        prediction = 0 
         if up_votes > 0 and down_votes == 0:
             prediction = 1
-            # "Best" config logic (Highest step size)
             best_voter = max([v for v in valid_voters if v[0] == 'up'], key=lambda x: x[1]['step_size'])
         elif down_votes > 0 and up_votes == 0:
             prediction = -1
             best_voter = max([v for v in valid_voters if v[0] == 'down'], key=lambda x: x[1]['step_size'])
             
         if prediction != 0:
-            # Check correctness
-            # We use the grid of the "best" voter to determine ground truth movement
             _, _, chosen_seq, local_idx = best_voter
-            
             curr_lvl = chosen_seq[local_idx - 1]
             actual_next = chosen_seq[local_idx]
             actual_diff = actual_next - curr_lvl
@@ -230,6 +197,102 @@ def run_inference(df, model_path):
     accuracy = (correct / total_trades * 100) if total_trades > 0 else 0.0
     return accuracy, total_trades
 
+def run_live_prediction(history_df, model_path):
+    print(f"\n{'='*40}")
+    print(f"LIVE PREDICTION (ETH/USDT)")
+    print(f"{'='*40}")
+    
+    # 1. Load Model
+    with open(model_path, 'rb') as f:
+        model_data = pickle.load(f)
+    configs = model_data['ensemble_configs']
+    
+    # 2. Fetch Latest Data
+    print("[LIVE] Fetching most recent candles from Binance...")
+    exchange = ccxt.binance({'enableRateLimit': True})
+    
+    # Fetch a buffer (e.g. 50) to ensure we can stitch correctly
+    # We only display the last 10, but we need more context to avoid gaps if possible
+    live_ohlcv = exchange.fetch_ohlcv(SYMBOL, TIMEFRAME, limit=50)
+    
+    if not live_ohlcv:
+        print("[ERROR] Could not fetch live data.")
+        return
+
+    # 3. Process Live Data
+    # Convert to DF
+    live_df = pd.DataFrame(live_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    live_df['timestamp'] = pd.to_datetime(live_df['timestamp'], unit='ms', utc=True)
+    
+    # Remove unfinished candle (Last one returned by Binance is usually current/incomplete)
+    # We check if the last timestamp matches the current time roughly, but standard practice 
+    # for 'exclude unfinished' is just to drop the last row if using standard fetch_ohlcv
+    live_df = live_df.iloc[:-1] 
+    
+    # 4. Stitch with History (Crucial for Grid Alignment)
+    # The Grid Index calculation is path-dependent (cumprod). 
+    # We must append live data to the end of history_df to get correct integer levels.
+    full_df = pd.concat([history_df, live_df]).drop_duplicates(subset=['timestamp']).reset_index(drop=True)
+    
+    print(f"[LIVE] Combined History: {len(history_df)} rows + New Live Data. Total: {len(full_df)}")
+    
+    # 5. Display Last 10 Candles
+    print("\n--- Last 10 Finished Candles ---")
+    recent_10 = full_df.tail(10)[['timestamp', 'close', 'volume']]
+    print(recent_10.to_string(index=False))
+    print("--------------------------------")
+
+    # 6. Run Ensemble Prediction on the VERY LAST step
+    up_votes = 0
+    down_votes = 0
+    
+    # We need to calculate the grid for the *entire* stitched series
+    # then look at the last point.
+    
+    print("\n[LIVE] Computing votes...")
+    
+    for cfg in configs:
+        # Recalculate grid on full path
+        grid = get_grid_indices(full_df, cfg['step_size'])
+        seq_len = cfg['seq_len']
+        
+        # We need the sequence ending at the last finished candle
+        # grid[-1] is the level of the last finished candle.
+        # sequence is grid[-(seq_len):] -> This includes the current level as the last item
+        # Wait, training logic:
+        # current_seq_tuple = tuple(val_seq[local_target_idx - seq_len : local_target_idx])
+        # This means the tuple DOES NOT include the target. It includes the history leading up to it.
+        # So for live prediction of NEXT move, we take the last `seq_len` indices available.
+        
+        if len(grid) < seq_len:
+            continue
+            
+        current_seq_tuple = tuple(grid[-seq_len:])
+        current_level = current_seq_tuple[-1] # The level we are sitting at right now
+        
+        if current_seq_tuple in cfg['patterns']:
+            history = cfg['patterns'][current_seq_tuple]
+            predicted_level = Counter(history).most_common(1)[0][0]
+            diff = predicted_level - current_level
+            
+            if diff > 0:
+                up_votes += 1
+            elif diff < 0:
+                down_votes += 1
+    
+    # 7. Final Decision
+    print(f"[LIVE] Votes: UP={up_votes}, DOWN={down_votes}, Total Configs={len(configs)}")
+    
+    if up_votes > 0 and down_votes == 0:
+        decision = "LONG (UP) 🟢"
+    elif down_votes > 0 and up_votes == 0:
+        decision = "SHORT (DOWN) 🔴"
+    else:
+        decision = "NEUTRAL / NO TRADE ⚪" # Mixed votes or no matches
+        
+    print(f"\n>>> PREDICTION: {decision}")
+    print(f"{'='*40}\n")
+
 def main():
     # 1. Fetch Data
     df = fetch_or_load_data()
@@ -240,30 +303,29 @@ def main():
     # 2. Download Model
     model_path = download_model()
 
-    # 3. Run Inference
+    # 3. Run Inference (Backtest)
     acc, trades = run_inference(df, model_path)
 
     # 4. Evaluate Pass/Fail
     print(f"\n{'='*40}")
-    print(f"RESULTS ON 80-90% SPLIT (2020-2026)")
+    print(f"RESULTS ON 80-90% SPLIT")
     print(f"{'='*40}")
     print(f"Accuracy: {acc:.2f}%")
     print(f"Trades:   {trades}")
     print(f"{'-'*40}")
     
-    # Criteria Check
-    # Accuracy: ~85% (We allow a small buffer, e.g., > 80% to be generous, or strict 84-86)
-    # Trades: 1100 +- 100 (1000 to 1200)
-    
-    acc_pass = (TARGET_ACCURACY - ACCURACY_TOLERANCE) <= acc # >= 80% essentially
+    acc_pass = (TARGET_ACCURACY - ACCURACY_TOLERANCE) <= acc 
     trades_pass = (TARGET_TRADES - TRADES_TOLERANCE) <= trades <= (TARGET_TRADES + TRADES_TOLERANCE)
     
     if acc_pass and trades_pass:
         print("STATUS: PASS ✅")
-        print("Metric Logic: Accuracy ~85% and Trades approx 1100.")
     else:
         print("STATUS: FAIL ❌")
-        print(f"Reason: {'Accuracy too low ' if not acc_pass else ''}{'Trades out of range' if not trades_pass else ''}")
+        
+    # 5. Run Live Prediction
+    # We pass the 'df' which contains the 2020-2026 history.
+    # The function will append the latest 2026+ data to it.
+    run_live_prediction(df, model_path)
 
 if __name__ == "__main__":
     main()
