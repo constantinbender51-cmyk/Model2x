@@ -57,7 +57,7 @@ def get_db_connection():
         return None
 
 def init_db():
-    """Initializes the simplified tables"""
+    """Initializes tables with start_time and end_time columns"""
     logger.info("Initializing database...")
     conn = get_db_connection()
     if conn:
@@ -66,7 +66,9 @@ def init_db():
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS signal (
                     asset TEXT PRIMARY KEY,
-                    prediction TEXT
+                    prediction TEXT,
+                    start_time TIMESTAMP,
+                    end_time TIMESTAMP
                 );
             """)
             cur.execute("""
@@ -87,28 +89,37 @@ def init_db():
 
 def settle_and_update_fast(asset, new_pred, p_curr, p_prev):
     """
-    1. Saves new prediction immediately.
-    2. Calculates and saves outcome of previous signal.
+    1. Saves new prediction immediately (with timestamps).
+    2. Calculates and saves outcome of previous signal in a separate step.
     """
     conn = get_db_connection()
     if not conn: return
     
     try:
         cur = conn.cursor()
+        
+        # Capture current state before update
         cur.execute("SELECT prediction FROM signal WHERE asset = %s", (asset,))
         row = cur.fetchone()
         prev_pred_str = row[0] if row else None
 
-        # Update current signal
+        # Calculate timestamps
+        start_t = datetime.now(timezone.utc)
+        end_t = start_t + timedelta(minutes=30)
+
+        # Update current signal table
         cur.execute("""
-            INSERT INTO signal (asset, prediction)
-            VALUES (%s, %s)
+            INSERT INTO signal (asset, prediction, start_time, end_time)
+            VALUES (%s, %s, %s, %s)
             ON CONFLICT (asset) 
-            DO UPDATE SET prediction = EXCLUDED.prediction;
-        """, (asset, new_pred))
-        conn.commit() 
+            DO UPDATE SET 
+                prediction = EXCLUDED.prediction,
+                start_time = EXCLUDED.start_time,
+                end_time = EXCLUDED.end_time;
+        """, (asset, new_pred, start_t, end_t))
+        conn.commit() # Commit update to signal table immediately
         
-        # Settle previous signal
+        # Settle previous signal to history
         if prev_pred_str:
             signal_map = {"LONG": 1.0, "SHORT": -1.0, "NEUTRAL": 0.0}
             val = signal_map.get(prev_pred_str, 0.0)
@@ -119,7 +130,7 @@ def settle_and_update_fast(asset, new_pred, p_curr, p_prev):
                 INSERT INTO signal_history (time, asset, prediction, outcome)
                 VALUES (CURRENT_TIMESTAMP, %s, %s, %s)
             """, (asset, prev_pred_str, outcome))
-            conn.commit()
+            conn.commit() # Commit historical entry separately
             
             icon = "✅" if outcome > 0 else "❌" if outcome < 0 else "➖"
             logger.info(f"{asset:12} | New: {new_pred:8} | Prev: {outcome:+.4f}% {icon}")
@@ -166,8 +177,8 @@ def run_single_asset_live(symbol, anchor_price, model_data, exchange):
         ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=20)
         if len(ohlcv) < 3: return "ERROR", None, None
         
-        p_curr = ohlcv[-2][4]  # Close of the last completed candle
-        p_prev = ohlcv[-3][4]  # Close of the candle before that
+        p_curr = ohlcv[-2][4]  
+        p_prev = ohlcv[-3][4]  
         
         live_df = pd.DataFrame(ohlcv[:-1], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         log_prices = np.log(live_df['close'].to_numpy() / anchor_price)
@@ -204,7 +215,6 @@ def start_multi_asset_loop(loaded_models, anchor_prices):
                 time.sleep(REQUEST_DELAY)
 
             now = time.time()
-            # Calculate sleep until the next 30-minute mark
             sleep_time = ((now // 1800) + 1) * 1800 - now + 10 
             logger.info(f"Cycle complete. Sleeping {sleep_time/60:.2f} minutes...")
             time.sleep(sleep_time)
@@ -223,7 +233,6 @@ def main():
         logger.error("No models were successfully loaded. Exiting.")
         return
 
-    # --- VALIDATION STEP: TEST 2 RANDOM ASSETS ---
     available_symbols = list(loaded_models.keys())
     sample_count = min(2, len(available_symbols))
     test_symbols = random.sample(available_symbols, sample_count)
@@ -243,7 +252,6 @@ def main():
         else:
             logger.info(f"PRE-FLIGHT: {sym} check successful. Initial Prediction: {pred}")
 
-    # --- PRODUCTION START ---
     if validation_passed:
         logger.info("All checks passed. Starting production loop for all assets.")
         anchors = {sym: loaded_models[sym]['initial_price'] for sym in loaded_models}
