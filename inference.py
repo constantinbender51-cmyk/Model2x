@@ -93,26 +93,69 @@ def init_db():
                 );
             """)
             
-            # Simple signal history: asset, pnl, time
+            # Check if signal_history table exists and has correct structure
             cur.execute("""
-                CREATE TABLE IF NOT EXISTS signal_history (
-                    id SERIAL PRIMARY KEY,
-                    asset TEXT NOT NULL,
-                    pnl NUMERIC NOT NULL,
-                    time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'signal_history'
                 );
             """)
+            table_exists = cur.fetchone()[0]
             
-            # Create index for querying
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_asset_time 
-                ON signal_history (asset, time);
-            """)
+            if table_exists:
+                # Check if table has the expected columns
+                cur.execute("""
+                    SELECT column_name, data_type 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'signal_history' 
+                    ORDER BY ordinal_position;
+                """)
+                columns = cur.fetchall()
+                
+                expected_columns = [
+                    ('id', 'integer'),
+                    ('asset', 'text'),
+                    ('pnl', 'numeric'),
+                    ('time', 'timestamp without time zone')
+                ]
+                
+                # Compare actual vs expected columns
+                actual_columns = [(col[0], col[1]) for col in columns]
+                
+                if len(actual_columns) != len(expected_columns) or any(a != e for a, e in zip(actual_columns, expected_columns)):
+                    logger.warning("signal_history table structure is incompatible. Dropping and recreating...")
+                    cur.execute("DROP TABLE signal_history;")
+                    create_new_table = True
+                else:
+                    logger.info("signal_history table already exists with correct structure.")
+                    create_new_table = False
+            else:
+                create_new_table = True
+            
+            if create_new_table:
+                # Create new signal_history table
+                cur.execute("""
+                    CREATE TABLE signal_history (
+                        id SERIAL PRIMARY KEY,
+                        asset TEXT NOT NULL,
+                        pnl NUMERIC NOT NULL,
+                        time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    );
+                """)
+                
+                # Create index for querying
+                cur.execute("""
+                    CREATE INDEX idx_asset_time 
+                    ON signal_history (asset, time);
+                """)
+                
+                logger.info("Created new signal_history table.")
             
             conn.commit()
             cur.close()
             conn.close()
-            logger.info("Tables 'signal' and 'signal_history' are ready.")
+            logger.info("Database initialization complete.")
+            
         except Exception as e:
             logger.error(f"Failed to init DB: {e}")
             if conn:
