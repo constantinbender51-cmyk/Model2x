@@ -8,6 +8,7 @@ import ccxt
 import psycopg2 
 import logging
 import random
+import json
 from datetime import datetime, timezone, timedelta
 from collections import Counter
 from huggingface_hub import hf_hub_download
@@ -39,9 +40,25 @@ HF_REPO_ID = "Llama26051996/Models"
 HF_FOLDER = "model2x"
 
 REQUEST_DELAY = 0.5
+ENTRY_TRACKER_FILE = "entry_prices.json"
 
 def ensure_directories():
     os.makedirs(DATA_DIR, exist_ok=True)
+
+# --- ENTRY PRICE TRACKING (NOT IN DB) ---
+
+def load_entry_prices():
+    if os.path.exists(ENTRY_TRACKER_FILE):
+        try:
+            with open(ENTRY_TRACKER_FILE, 'r') as f:
+                return json.load(f)
+        except:
+            return {}
+    return {}
+
+def save_entry_prices(tracker):
+    with open(ENTRY_TRACKER_FILE, 'w') as f:
+        json.dump(tracker, f)
 
 # --- DATABASE FUNCTIONS ---
 
@@ -57,12 +74,13 @@ def get_db_connection():
         return None
 
 def init_db():
-    """Initializes tables with start_time and end_time columns"""
-    logger.info("Initializing database...")
+    """Initializes tables and renames 'outcome' to 'pnl'"""
+    logger.info("Initializing database and migrating columns...")
     conn = get_db_connection()
     if conn:
         try:
             cur = conn.cursor()
+            # 1. Ensure tables exist
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS signal (
                     asset TEXT PRIMARY KEY,
@@ -76,21 +94,31 @@ def init_db():
                     time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     asset TEXT NOT NULL,
                     prediction TEXT NOT NULL,
-                    outcome NUMERIC NOT NULL,
+                    pnl NUMERIC NOT NULL,
                     PRIMARY KEY (time, asset)
                 );
+            """)
+            # 2. Migration: Rename outcome to pnl if the old column exists
+            cur.execute("""
+                DO $$ 
+                BEGIN 
+                    IF EXISTS (SELECT 1 FROM information_schema.columns 
+                               WHERE table_name='signal_history' AND column_name='outcome') THEN
+                        ALTER TABLE signal_history RENAME COLUMN outcome TO pnl;
+                    END IF;
+                END $$;
             """)
             conn.commit()
             cur.close()
             conn.close()
-            logger.info("Tables are ready.")
+            logger.info("Database migration complete.")
         except Exception as e:
             logger.error(f"Failed to init DB: {e}")
 
-def settle_and_update_fast(asset, new_pred, p_curr, p_prev):
+def settle_and_update_fast(asset, new_pred, p_market, entry_tracker):
     """
-    1. Saves new prediction immediately (with timestamps).
-    2. Calculates and saves outcome of previous signal in a separate step.
+    1. Updates signal state with timestamps.
+    2. Calculates pnl from entry price (stored in json) and exit price.
     """
     conn = get_db_connection()
     if not conn: return
@@ -98,16 +126,30 @@ def settle_and_update_fast(asset, new_pred, p_curr, p_prev):
     try:
         cur = conn.cursor()
         
-        # Capture current state before update
+        # Check previous prediction from DB
         cur.execute("SELECT prediction FROM signal WHERE asset = %s", (asset,))
         row = cur.fetchone()
         prev_pred_str = row[0] if row else None
+        
+        # Calculate PNL if previous signal was valid and we have an entry price
+        if prev_pred_str in ["LONG", "SHORT"] and asset in entry_tracker:
+            p_entry = entry_tracker[asset]
+            p_exit = p_market
+            side = 1.0 if prev_pred_str == "LONG" else -1.0
+            pnl = round(side * ((p_exit - p_entry) / p_entry) * 100, 6)
+            
+            cur.execute("""
+                INSERT INTO signal_history (time, asset, prediction, pnl)
+                VALUES (CURRENT_TIMESTAMP, %s, %s, %s)
+            """, (asset, prev_pred_str, pnl))
+            conn.commit() # Separate commit for history
+            
+            icon = "✅" if pnl > 0 else "❌" if pnl < 0 else "➖"
+            logger.info(f"{asset:12} | Exit: {p_exit:.4f} | PNL: {pnl:+.4f}% {icon}")
 
-        # Calculate timestamps
+        # Update Current Signal Table
         start_t = datetime.now(timezone.utc)
         end_t = start_t + timedelta(minutes=30)
-
-        # Update current signal table
         cur.execute("""
             INSERT INTO signal (asset, prediction, start_time, end_time)
             VALUES (%s, %s, %s, %s)
@@ -117,30 +159,19 @@ def settle_and_update_fast(asset, new_pred, p_curr, p_prev):
                 start_time = EXCLUDED.start_time,
                 end_time = EXCLUDED.end_time;
         """, (asset, new_pred, start_t, end_t))
-        conn.commit() # Commit update to signal table immediately
+        conn.commit() # Separate commit for signal update
         
-        # Settle previous signal to history
-        if prev_pred_str:
-            signal_map = {"LONG": 1.0, "SHORT": -1.0, "NEUTRAL": 0.0}
-            val = signal_map.get(prev_pred_str, 0.0)
-            
-            outcome = val * ((p_curr - p_prev) / p_prev) * 100
-            
-            cur.execute("""
-                INSERT INTO signal_history (time, asset, prediction, outcome)
-                VALUES (CURRENT_TIMESTAMP, %s, %s, %s)
-            """, (asset, prev_pred_str, outcome))
-            conn.commit() # Commit historical entry separately
-            
-            icon = "✅" if outcome > 0 else "❌" if outcome < 0 else "➖"
-            logger.info(f"{asset:12} | New: {new_pred:8} | Prev: {outcome:+.4f}% {icon}")
-        else:
+        # Record NEW entry price locally
+        entry_tracker[asset] = p_market
+        save_entry_prices(entry_tracker)
+        
+        if not prev_pred_str:
             logger.info(f"{asset:12} | New: {new_pred:8} | Initial Run")
 
         cur.close()
         conn.close()
     except Exception as e:
-        logger.error(f"Failed fast update for {asset}: {e}")
+        logger.error(f"Failed update for {asset}: {e}")
 
 # --- DATA & MODEL FUNCTIONS ---
 
@@ -175,10 +206,9 @@ def run_single_asset_live(symbol, anchor_price, model_data, exchange):
     configs = model_data['ensemble_configs']
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=20)
-        if len(ohlcv) < 3: return "ERROR", None, None
+        if len(ohlcv) < 3: return "ERROR", None
         
-        p_curr = ohlcv[-2][4]  
-        p_prev = ohlcv[-3][4]  
+        p_market = ohlcv[-2][4]  # Close of last completed candle
         
         live_df = pd.DataFrame(ohlcv[:-1], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         log_prices = np.log(live_df['close'].to_numpy() / anchor_price)
@@ -194,23 +224,24 @@ def run_single_asset_live(symbol, anchor_price, model_data, exchange):
                 elif pred_lvl < seq[-1]: down += 1
         
         res = "LONG" if (up > 0 and down == 0) else "SHORT" if (down > 0 and up == 0) else "NEUTRAL"
-        return res, p_curr, p_prev
+        return res, p_market
     except Exception as e:
         logger.debug(f"Inference error for {symbol}: {e}")
-        return "ERROR", None, None
+        return "ERROR", None
 
 def start_multi_asset_loop(loaded_models, anchor_prices):
     exchange = ccxt.binance({'enableRateLimit': True})
+    entry_tracker = load_entry_prices()
     logger.info("Bot Live - Frequency: 30m")
     
     while True:
         try:
             for symbol, model_data in loaded_models.items():
                 anchor = anchor_prices.get(symbol)
-                new_pred, p_curr, p_prev = run_single_asset_live(symbol, anchor, model_data, exchange)
+                new_pred, p_market = run_single_asset_live(symbol, anchor, model_data, exchange)
                 
                 if new_pred != "ERROR":
-                    settle_and_update_fast(symbol, new_pred, p_curr, p_prev)
+                    settle_and_update_fast(symbol, new_pred, p_market, entry_tracker)
                 
                 time.sleep(REQUEST_DELAY)
 
@@ -237,23 +268,19 @@ def main():
     sample_count = min(2, len(available_symbols))
     test_symbols = random.sample(available_symbols, sample_count)
     
-    logger.info(f"--- RUNNING STARTUP VALIDATION ON: {test_symbols} ---")
+    logger.info(f"--- STARTUP VALIDATION: {test_symbols} ---")
     exchange = ccxt.binance({'enableRateLimit': True})
     
     validation_passed = True
     for sym in test_symbols:
         anchor = loaded_models[sym]['initial_price']
-        pred, p_c, p_p = run_single_asset_live(sym, anchor, loaded_models[sym], exchange)
-        
+        pred, p_m = run_single_asset_live(sym, anchor, loaded_models[sym], exchange)
         if pred == "ERROR":
-            logger.error(f"CRITICAL: Validation failed for {sym}. Check API connection.")
             validation_passed = False
             break
-        else:
-            logger.info(f"PRE-FLIGHT: {sym} check successful. Initial Prediction: {pred}")
+        logger.info(f"PRE-FLIGHT: {sym} OK. Price: {p_m}")
 
     if validation_passed:
-        logger.info("All checks passed. Starting production loop for all assets.")
         anchors = {sym: loaded_models[sym]['initial_price'] for sym in loaded_models}
         start_multi_asset_loop(loaded_models, anchors)
     else:
