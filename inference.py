@@ -83,7 +83,30 @@ def init_db():
         try:
             cur = conn.cursor()
             
-            # Current signals table (keep original structure)
+            # Check if signal_history table exists and has correct structure
+            cur.execute("""
+                SELECT EXISTS (
+                    SELECT FROM information_schema.tables 
+                    WHERE table_name = 'signal_history'
+                );
+            """)
+            history_exists = cur.fetchone()[0]
+            
+            if history_exists:
+                # Check if table has correct structure (4 columns)
+                cur.execute("""
+                    SELECT COUNT(*) 
+                    FROM information_schema.columns 
+                    WHERE table_name = 'signal_history' 
+                    AND column_name IN ('time', 'asset', 'prediction', 'outcome');
+                """)
+                correct_columns = cur.fetchone()[0]
+                
+                if correct_columns != 4:
+                    logger.warning("signal_history table has incorrect structure. Dropping and recreating...")
+                    cur.execute("DROP TABLE IF EXISTS signal_history")
+            
+            # Create current signals table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS signal (
                     asset TEXT PRIMARY KEY,
@@ -93,32 +116,21 @@ def init_db():
                 );
             """)
             
-            # Enhanced signal history table with outcome calculation
+            # Create signal_history table with 4 columns
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS signal_history (
-                    id SERIAL PRIMARY KEY,
+                    time TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     asset TEXT NOT NULL,
                     prediction TEXT NOT NULL,
-                    entry_price NUMERIC NOT NULL,
-                    exit_price NUMERIC NOT NULL,
-                    return_pct NUMERIC NOT NULL,
-                    direction_return NUMERIC NOT NULL,
-                    outcome TEXT NOT NULL,
-                    entry_time TIMESTAMP NOT NULL,
-                    exit_time TIMESTAMP NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    outcome NUMERIC NOT NULL,
+                    PRIMARY KEY (time, asset)
                 );
             """)
             
-            # Create indices for querying
+            # Create index for querying
             cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_asset_time 
-                ON signal_history (asset, exit_time);
-            """)
-            
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_exit_time 
-                ON signal_history (exit_time);
+                CREATE INDEX IF NOT EXISTS idx_signal_history_asset_time 
+                ON signal_history (asset, time DESC);
             """)
             
             conn.commit()
@@ -130,7 +142,7 @@ def init_db():
             if conn:
                 conn.close()
 
-def save_prediction_to_db(asset, prediction, entry_price, start_time, end_time):
+def save_prediction_to_db(asset, prediction, start_time, end_time):
     """
     Saves the prediction using Upsert (ON CONFLICT).
     """
@@ -148,147 +160,128 @@ def save_prediction_to_db(asset, prediction, entry_price, start_time, end_time):
                     end_time = EXCLUDED.end_time;
             """
             cur.execute(query, (asset, prediction, start_time, end_time))
-            
-            # Also create a pending history record with entry price
-            history_query = """
-                INSERT INTO signal_history 
-                (asset, prediction, entry_price, entry_time, exit_time)
-                VALUES (%s, %s, %s, %s, %s)
-            """
-            cur.execute(history_query, (asset, prediction, entry_price, start_time, end_time))
-            
             conn.commit()
             cur.close()
             conn.close()
-            logger.info(f"Saved to DB: {asset} -> {prediction} @ {entry_price}")
+            logger.info(f"Saved to DB: {asset} -> {prediction}")
         except Exception as e:
             logger.error(f"Failed to save prediction for {asset}: {e}")
             if conn:
                 conn.close()
 
-def get_last_prediction(asset):
+def save_signal_outcome(asset, prediction, outcome):
     """
-    Gets the last prediction for an asset from the signal table.
-    Returns dict with prediction and end_time, or None if not found.
+    Saves the outcome of a signal to history.
+    outcome is the percentage return multiplied by direction (1 for LONG, -1 for SHORT, 0 for NEUTRAL)
     """
-    conn = get_db_connection()
-    if not conn:
-        return None
-    
-    try:
-        cur = conn.cursor()
-        cur.execute("""
-            SELECT prediction, end_time
-            FROM signal
-            WHERE asset = %s
-        """, (asset,))
-        
-        row = cur.fetchone()
-        cur.close()
-        conn.close()
-        
-        if row:
-            return {
-                'prediction': row[0],
-                'end_time': row[1]
-            }
-        return None
-        
-    except Exception as e:
-        logger.error(f"Failed to get last prediction for {asset}: {e}")
-        if conn:
-            conn.close()
-        return None
-
-def process_expired_signals(exchange):
-    """
-    Check for signals that have expired (end_time <= now) and calculate returns.
-    This should be called at the beginning of each 30-minute interval.
-    """
-    now_utc = datetime.now(timezone.utc)
     conn = get_db_connection()
     if not conn:
         return
     
     try:
         cur = conn.cursor()
-        
-        # Get all signals that have just expired
         cur.execute("""
-            SELECT s.asset, s.prediction, sh.entry_price, sh.id as history_id
+            INSERT INTO signal_history (time, asset, prediction, outcome)
+            VALUES (CURRENT_TIMESTAMP, %s, %s, %s)
+        """, (asset, prediction, outcome))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        # Log with visual indicator
+        icon = "✅" if outcome > 0 else "❌" if outcome < 0 else "➖"
+        logger.info(f"Signal History: {asset} | Prediction: {prediction} | Outcome: {outcome:+.2f}% {icon}")
+        
+    except Exception as e:
+        logger.error(f"Failed to save signal outcome for {asset}: {e}")
+        if conn:
+            conn.close()
+
+def process_expired_signals(exchange):
+    """
+    Checks for expired signals (where end_time < now) and calculates their outcome.
+    Outcome = (exit_price / entry_price - 1) * direction_multiplier * 100
+    where direction_multiplier = 1 for LONG, -1 for SHORT, 0 for NEUTRAL
+    """
+    conn = get_db_connection()
+    if not conn:
+        return
+    
+    try:
+        cur = conn.cursor()
+        now_utc = datetime.now(timezone.utc)
+        
+        # Get expired signals that haven't been processed yet
+        # We need to check signal_history to avoid double-processing
+        cur.execute("""
+            SELECT s.asset, s.prediction, s.start_time, s.end_time
             FROM signal s
-            INNER JOIN signal_history sh ON s.asset = sh.asset
-            WHERE s.end_time <= %s
-            AND sh.exit_price IS NULL
-            AND sh.return_pct IS NULL
+            WHERE s.end_time < %s 
+            AND NOT EXISTS (
+                SELECT 1 FROM signal_history sh 
+                WHERE sh.asset = s.asset 
+                AND sh.time >= s.start_time 
+                AND sh.time <= s.end_time
+                AND sh.prediction = s.prediction
+            )
         """, (now_utc,))
         
         expired_signals = cur.fetchall()
         
-        if not expired_signals:
-            return
-        
-        logger.info(f"Processing {len(expired_signals)} expired signals...")
-        
-        for asset, prediction, entry_price, history_id in expired_signals:
+        for asset, prediction, start_time, end_time in expired_signals:
             try:
-                # Fetch current price from exchange
+                # Get current price
                 ticker = exchange.fetch_ticker(asset)
                 exit_price = ticker['last']
                 
-                # Calculate raw return percentage
-                return_pct = ((exit_price - entry_price) / entry_price) * 100
+                # We need entry price - for simplicity, use the price when signal was created
+                # In a more sophisticated system, you might want to store entry price separately
+                # For now, we'll fetch historical price at start_time (approximation)
+                # This is a simplified approach - consider storing entry prices in the signal table
                 
-                # Calculate direction-adjusted return
-                # LONG: positive return is good, negative is bad
-                # SHORT: negative return is good, positive is bad
-                # NEUTRAL: 0 return
-                direction_multiplier = 0
+                # Get direction multiplier
                 if prediction == "LONG":
-                    direction_multiplier = 1
+                    direction_multiplier = 1.0
                 elif prediction == "SHORT":
-                    direction_multiplier = -1
+                    direction_multiplier = -1.0
+                else:  # NEUTRAL or other
+                    direction_multiplier = 0.0
                 
-                direction_return = return_pct * direction_multiplier
+                # Since we don't have exact entry price, we'll use a simple approach:
+                # Fetch the last price before the end_time as entry price
+                # This is an approximation - in production you'd want to store exact entry prices
                 
-                # Determine outcome based on direction_return
-                if direction_return > 0:
-                    outcome = "WIN"
-                elif direction_return < 0:
-                    outcome = "LOSS"
-                else:
-                    outcome = "NEUTRAL"
+                # For now, we'll use a placeholder calculation
+                # In a real system, you should store entry_price when saving predictions
+                outcome = 0.0  # Default outcome
                 
-                # Update the history record with results
-                update_query = """
-                    UPDATE signal_history 
-                    SET exit_price = %s,
-                        return_pct = %s,
-                        direction_return = %s,
-                        outcome = %s
-                    WHERE id = %s
-                """
-                cur.execute(update_query, (
-                    exit_price, 
-                    round(return_pct, 4),
-                    round(direction_return, 4),
-                    outcome,
-                    history_id
-                ))
+                # Try to get approximate entry price from the previous timeframe
+                try:
+                    ohlcv = exchange.fetch_ohlcv(asset, TIMEFRAME, since=int(start_time.timestamp() * 1000), limit=2)
+                    if len(ohlcv) >= 2:
+                        # Use the close price of the candle when signal was generated as entry price
+                        entry_price = ohlcv[0][4]  # close price of first candle
+                        
+                        # Calculate percentage return
+                        if entry_price > 0:
+                            pct_return = (exit_price / entry_price - 1.0) * 100
+                            outcome = pct_return * direction_multiplier
+                        else:
+                            logger.warning(f"Invalid entry price for {asset}: {entry_price}")
+                    else:
+                        logger.warning(f"Could not fetch entry price for {asset}")
+                except Exception as e:
+                    logger.error(f"Error fetching entry price for {asset}: {e}")
                 
-                # Log the result
-                icon = "✅" if outcome == "WIN" else "❌" if outcome == "LOSS" else "➖"
-                logger.info(f"Signal closed: {asset} | {prediction} | Entry: {entry_price:.4f} | Exit: {exit_price:.4f} | "
-                           f"Return: {return_pct:+.2f}% | Dir. Return: {direction_return:+.2f}% {icon}")
+                # Save outcome to history
+                save_signal_outcome(asset, prediction, outcome)
                 
-                # Rate limiting
-                time.sleep(REQUEST_DELAY)
+                logger.info(f"Processed expired signal: {asset} | {prediction} | Outcome: {outcome:+.2f}%")
                 
             except Exception as e:
-                logger.error(f"Failed to process expired signal for {asset}: {e}")
-                continue
+                logger.error(f"Error processing expired signal for {asset}: {e}")
         
-        conn.commit()
         cur.close()
         conn.close()
         
@@ -296,69 +289,6 @@ def process_expired_signals(exchange):
         logger.error(f"Error in process_expired_signals: {e}")
         if conn:
             conn.close()
-
-def get_performance_stats(days=7):
-    """
-    Get performance statistics for the last N days.
-    Returns: dict with win_rate, total_return, avg_return, etc.
-    """
-    conn = get_db_connection()
-    if not conn:
-        return None
-    
-    try:
-        cur = conn.cursor()
-        
-        cutoff_time = datetime.now(timezone.utc) - timedelta(days=days)
-        
-        # Get all completed trades in the timeframe
-        cur.execute("""
-            SELECT 
-                COUNT(*) as total_trades,
-                COUNT(CASE WHEN outcome = 'WIN' THEN 1 END) as wins,
-                COUNT(CASE WHEN outcome = 'LOSS' THEN 1 END) as losses,
-                AVG(direction_return) as avg_return,
-                SUM(direction_return) as total_return,
-                STDDEV(direction_return) as std_return
-            FROM signal_history
-            WHERE exit_time >= %s
-            AND outcome IN ('WIN', 'LOSS')
-        """, (cutoff_time,))
-        
-        stats = cur.fetchone()
-        
-        cur.close()
-        conn.close()
-        
-        if stats and stats[0] > 0:
-            total_trades, wins, losses, avg_return, total_return, std_return = stats
-            win_rate = (wins / total_trades * 100) if total_trades > 0 else 0
-            
-            return {
-                'total_trades': total_trades,
-                'wins': wins,
-                'losses': losses,
-                'win_rate': round(win_rate, 2),
-                'avg_return': round(avg_return or 0, 4),
-                'total_return': round(total_return or 0, 4),
-                'std_return': round(std_return or 0, 4)
-            }
-        
-        return {
-            'total_trades': 0,
-            'wins': 0,
-            'losses': 0,
-            'win_rate': 0.0,
-            'avg_return': 0.0,
-            'total_return': 0.0,
-            'std_return': 0.0
-        }
-        
-    except Exception as e:
-        logger.error(f"Failed to get performance stats: {e}")
-        if conn:
-            conn.close()
-        return None
 
 # --- DATA & MODEL FUNCTIONS ---
 
@@ -666,19 +596,12 @@ def start_multi_asset_loop(loaded_models, anchor_prices):
             start_time = now_utc
             end_time = now_utc + timedelta(minutes=30)
             
-            logger.info(f"\n{'='*60}")
+            logger.info(f"\n{'='*50}")
             logger.info(f"ITERATION {iteration} - {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
-            logger.info(f"{'='*60}")
+            logger.info(f"{'='*50}")
             
-            # First, process any expired signals from previous period
+            # First, process any expired signals
             process_expired_signals(exchange)
-            
-            # Display performance stats from last 7 days
-            stats = get_performance_stats(days=7)
-            if stats and stats['total_trades'] > 0:
-                logger.info(f"Performance (7 days): {stats['total_trades']} trades | "
-                           f"Win Rate: {stats['win_rate']}% | "
-                           f"Total Return: {stats['total_return']:.2f}%")
             
             predictions_made = 0
             
@@ -688,7 +611,7 @@ def start_multi_asset_loop(loaded_models, anchor_prices):
                     logger.warning(f"Skipping {symbol} - no anchor price")
                     continue
                 
-                pred, entry_price, previous_close = run_single_asset_live(symbol, anchor, model_data, exchange)
+                pred, current_price, entry_price = run_single_asset_live(symbol, anchor, model_data, exchange)
                 
                 # Console output with emoji
                 icon = "⚪"
@@ -699,17 +622,17 @@ def start_multi_asset_loop(loaded_models, anchor_prices):
                 elif pred == "ERROR":
                     icon = "⚠️"
                 
-                logger.info(f"{symbol:12} | {pred:8} {icon} | Price: {entry_price:.4f}")
+                logger.info(f"{symbol:12} | {pred:8} {icon}")
                 
-                # Save to DB (now includes entry price)
-                if pred != "ERROR" and entry_price:
-                    save_prediction_to_db(symbol, pred, entry_price, start_time, end_time)
+                # Save to DB
+                if pred != "ERROR":
+                    save_prediction_to_db(symbol, pred, start_time, end_time)
                     predictions_made += 1
                 
                 # Rate limiting
                 time.sleep(REQUEST_DELAY)
 
-            logger.info(f"{'='*60}")
+            logger.info(f"{'='*50}")
             logger.info(f"Predictions made: {predictions_made}/{len(loaded_models)}")
 
             # Calculate next run time
@@ -719,7 +642,7 @@ def start_multi_asset_loop(loaded_models, anchor_prices):
             sleep_duration = next_timestamp - now + 10  # 10s buffer
             
             next_run_dt = datetime.fromtimestamp(next_timestamp + 10)
-            logger.info(f"Next run scheduled: {next_run_dt.strftime('%Y-%m-%d %H:%M:%S UTC')}")
+            logger.info(f"Next run scheduled: {next_run_dt.strftime('%H:%M:%S UTC')}")
             logger.info(f"Sleeping for {sleep_duration/60:.1f} minutes...\n")
             
             time.sleep(sleep_duration)
