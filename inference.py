@@ -93,31 +93,20 @@ def init_db():
                 );
             """)
             
-            # Signal history table with outcome tracking
+            # Simple signal history: asset, pnl, time
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS signal_history (
                     id SERIAL PRIMARY KEY,
                     asset TEXT NOT NULL,
-                    prediction TEXT NOT NULL,
-                    start_time TIMESTAMP NOT NULL,
-                    end_time TIMESTAMP NOT NULL,
-                    entry_price NUMERIC NOT NULL,
-                    exit_price NUMERIC NOT NULL,
-                    outcome TEXT NOT NULL,
-                    pnl_percent NUMERIC NOT NULL,
-                    completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    pnl NUMERIC NOT NULL,
+                    time TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
             """)
             
-            # Create indexes if they don't exist
+            # Create index for querying
             cur.execute("""
                 CREATE INDEX IF NOT EXISTS idx_asset_time 
-                ON signal_history (asset, completed_at);
-            """)
-            
-            cur.execute("""
-                CREATE INDEX IF NOT EXISTS idx_outcome 
-                ON signal_history (outcome);
+                ON signal_history (asset, time);
             """)
             
             conn.commit()
@@ -156,149 +145,67 @@ def save_prediction_to_db(asset, prediction, start_time, end_time):
             if conn:
                 conn.close()
 
-def get_active_signals():
+def get_last_prediction(asset):
     """
-    Retrieves all active signals that need to be closed out.
-    Returns list of dicts with signal data.
+    Gets the last prediction for an asset from the signal table.
+    Returns dict with prediction and end_time, or None if not found.
     """
     conn = get_db_connection()
     if not conn:
-        return []
+        return None
     
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT asset, prediction, start_time, end_time
+            SELECT prediction, end_time
             FROM signal
-            WHERE end_time <= %s
-            ORDER BY end_time
-        """, (datetime.now(timezone.utc),))
+            WHERE asset = %s
+        """, (asset,))
         
-        rows = cur.fetchall()
+        row = cur.fetchone()
         cur.close()
         conn.close()
         
-        return [
-            {
-                'asset': row[0],
-                'prediction': row[1],
-                'start_time': row[2],
-                'end_time': row[3]
+        if row:
+            return {
+                'prediction': row[0],
+                'end_time': row[1]
             }
-            for row in rows
-        ]
+        return None
+        
     except Exception as e:
-        logger.error(f"Failed to get active signals: {e}")
+        logger.error(f"Failed to get last prediction for {asset}: {e}")
         if conn:
             conn.close()
-        return []
+        return None
 
-def close_signal(asset, prediction, start_time, end_time, entry_price, exit_price):
+def save_to_history(asset, pnl):
     """
-    Closes a signal by:
-    1. Calculating outcome and PnL
-    2. Saving to signal_history
-    3. Removing from active signals
+    Saves PnL to signal_history.
     """
     conn = get_db_connection()
     if not conn:
         return
     
     try:
-        # Calculate PnL
-        if prediction == "LONG":
-            pnl_percent = ((exit_price - entry_price) / entry_price) * 100
-        elif prediction == "SHORT":
-            pnl_percent = ((entry_price - exit_price) / entry_price) * 100
-        else:  # NEUTRAL
-            pnl_percent = 0.0
-        
-        # Determine outcome
-        if pnl_percent > 0.1:  # Small threshold to avoid rounding issues
-            outcome = "WIN"
-        elif pnl_percent < -0.1:
-            outcome = "LOSS"
-        else:
-            outcome = "BREAKEVEN"
-        
         cur = conn.cursor()
-        
-        # Insert into history
         cur.execute("""
-            INSERT INTO signal_history 
-            (asset, prediction, start_time, end_time, entry_price, exit_price, outcome, pnl_percent)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-        """, (asset, prediction, start_time, end_time, entry_price, exit_price, outcome, pnl_percent))
-        
-        # Remove from active signals
-        cur.execute("DELETE FROM signal WHERE asset = %s", (asset,))
+            INSERT INTO signal_history (asset, pnl)
+            VALUES (%s, %s)
+        """, (asset, pnl))
         
         conn.commit()
         cur.close()
         conn.close()
         
         # Log with visual indicator
-        outcome_icon = "✅" if outcome == "WIN" else "❌" if outcome == "LOSS" else "➖"
-        logger.info(f"Signal Closed: {asset} | {prediction} | PnL: {pnl_percent:+.2f}% | {outcome} {outcome_icon}")
+        icon = "✅" if pnl > 0 else "❌" if pnl < 0 else "➖"
+        logger.info(f"History: {asset} | PnL: {pnl:+.2f}% {icon}")
         
     except Exception as e:
-        logger.error(f"Failed to close signal for {asset}: {e}")
+        logger.error(f"Failed to save history for {asset}: {e}")
         if conn:
             conn.close()
-
-def get_current_price(symbol, exchange):
-    """Fetches current price for an asset"""
-    try:
-        ticker = exchange.fetch_ticker(symbol)
-        return ticker['last']
-    except Exception as e:
-        logger.error(f"Failed to get price for {symbol}: {e}")
-        return None
-
-def process_expired_signals(exchange):
-    """
-    Checks for signals that have reached their end_time and closes them.
-    Fetches entry price from when signal was created.
-    """
-    active_signals = get_active_signals()
-    
-    if not active_signals:
-        return
-    
-    logger.info(f"Processing {len(active_signals)} expired signals...")
-    
-    for signal in active_signals:
-        # Get both entry and exit prices
-        exit_price = get_current_price(signal['asset'], exchange)
-        
-        if not exit_price:
-            logger.warning(f"Could not get exit price for {signal['asset']}, skipping")
-            continue
-            
-        # Fetch entry price from start_time
-        try:
-            # Get the candle at start_time
-            start_ts = int(signal['start_time'].timestamp() * 1000)
-            ohlcv = exchange.fetch_ohlcv(signal['asset'], TIMEFRAME, since=start_ts, limit=1)
-            
-            if ohlcv and len(ohlcv) > 0:
-                entry_price = ohlcv[0][4]  # Close price of the entry candle
-                
-                close_signal(
-                    asset=signal['asset'],
-                    prediction=signal['prediction'],
-                    start_time=signal['start_time'],
-                    end_time=signal['end_time'],
-                    entry_price=entry_price,
-                    exit_price=exit_price
-                )
-            else:
-                logger.warning(f"Could not fetch entry candle for {signal['asset']}, skipping")
-                
-        except Exception as e:
-            logger.error(f"Error processing signal for {signal['asset']}: {e}")
-            
-        time.sleep(REQUEST_DELAY)
 
 # --- DATA & MODEL FUNCTIONS ---
 
@@ -529,7 +436,7 @@ def run_backtest_inference(df, model_data):
 def run_single_asset_live(symbol, anchor_price, model_data, exchange):
     """
     Performs a single live prediction for ONE asset.
-    Returns (prediction_string, current_price)
+    Returns (prediction_string, current_price, previous_candle_close)
     """
     configs = model_data['ensemble_configs']
     
@@ -539,10 +446,10 @@ def run_single_asset_live(symbol, anchor_price, model_data, exchange):
         current_price = ticker['last']
     except Exception as e:
         logger.error(f"Failed to fetch live data for {symbol}: {e}")
-        return "ERROR", None
+        return "ERROR", None, None
 
-    if not live_ohlcv:
-        return "ERROR", None
+    if not live_ohlcv or len(live_ohlcv) < 2:
+        return "ERROR", None, None
 
     live_df = pd.DataFrame(live_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     live_df['timestamp'] = pd.to_datetime(live_df['timestamp'], unit='ms', utc=True)
@@ -550,8 +457,11 @@ def run_single_asset_live(symbol, anchor_price, model_data, exchange):
     # Drop unfinished candle
     live_df = live_df.iloc[:-1] 
     
-    if live_df.empty:
-        return "ERROR", None
+    if len(live_df) < 2:
+        return "ERROR", None, None
+    
+    # Get previous candle close (the one we just completed)
+    previous_candle_close = live_df.iloc[-1]['close']
     
     prices = live_df['close'].to_numpy()
     log_prices = np.log(prices / anchor_price)
@@ -581,11 +491,11 @@ def run_single_asset_live(symbol, anchor_price, model_data, exchange):
                 down_votes += 1
     
     if up_votes > 0 and down_votes == 0:
-        return "LONG", current_price
+        return "LONG", current_price, previous_candle_close
     elif down_votes > 0 and up_votes == 0:
-        return "SHORT", current_price
+        return "SHORT", current_price, previous_candle_close
     else:
-        return "NEUTRAL", current_price
+        return "NEUTRAL", current_price, previous_candle_close
 
 def start_multi_asset_loop(loaded_models, anchor_prices):
     """
