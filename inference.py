@@ -76,30 +76,52 @@ def get_db_connection():
         return None
 
 def init_db():
-    """Creates the signal table if it does not exist"""
+    """Creates the signal and signal_history tables if they don't exist"""
     logger.info("Initializing database...")
     conn = get_db_connection()
     if conn:
         try:
             cur = conn.cursor()
+            
+            # Current signals table
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS signal (
                     asset TEXT PRIMARY KEY,
                     prediction TEXT,
                     start_time TIMESTAMP,
-                    end_time TIMESTAMP
+                    end_time TIMESTAMP,
+                    entry_price NUMERIC
                 );
             """)
+            
+            # Signal history table with outcome tracking
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS signal_history (
+                    id SERIAL PRIMARY KEY,
+                    asset TEXT NOT NULL,
+                    prediction TEXT NOT NULL,
+                    start_time TIMESTAMP NOT NULL,
+                    end_time TIMESTAMP NOT NULL,
+                    entry_price NUMERIC NOT NULL,
+                    exit_price NUMERIC NOT NULL,
+                    outcome TEXT NOT NULL,
+                    pnl_percent NUMERIC NOT NULL,
+                    completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    INDEX idx_asset_time (asset, completed_at),
+                    INDEX idx_outcome (outcome)
+                );
+            """)
+            
             conn.commit()
             cur.close()
             conn.close()
-            logger.info("Table 'signal' is ready.")
+            logger.info("Tables 'signal' and 'signal_history' are ready.")
         except Exception as e:
             logger.error(f"Failed to init DB: {e}")
             if conn:
                 conn.close()
 
-def save_prediction_to_db(asset, prediction, start_time, end_time):
+def save_prediction_to_db(asset, prediction, start_time, end_time, entry_price):
     """
     Saves the prediction using Upsert (ON CONFLICT).
     """
@@ -108,15 +130,16 @@ def save_prediction_to_db(asset, prediction, start_time, end_time):
         try:
             cur = conn.cursor()
             query = """
-                INSERT INTO signal (asset, prediction, start_time, end_time)
-                VALUES (%s, %s, %s, %s)
+                INSERT INTO signal (asset, prediction, start_time, end_time, entry_price)
+                VALUES (%s, %s, %s, %s, %s)
                 ON CONFLICT (asset) 
                 DO UPDATE SET 
                     prediction = EXCLUDED.prediction,
                     start_time = EXCLUDED.start_time,
-                    end_time = EXCLUDED.end_time;
+                    end_time = EXCLUDED.end_time,
+                    entry_price = EXCLUDED.entry_price;
             """
-            cur.execute(query, (asset, prediction, start_time, end_time))
+            cur.execute(query, (asset, prediction, start_time, end_time, entry_price))
             conn.commit()
             cur.close()
             conn.close()
@@ -125,6 +148,131 @@ def save_prediction_to_db(asset, prediction, start_time, end_time):
             logger.error(f"Failed to save prediction for {asset}: {e}")
             if conn:
                 conn.close()
+
+def get_active_signals():
+    """
+    Retrieves all active signals that need to be closed out.
+    Returns list of dicts with signal data.
+    """
+    conn = get_db_connection()
+    if not conn:
+        return []
+    
+    try:
+        cur = conn.cursor()
+        cur.execute("""
+            SELECT asset, prediction, start_time, end_time, entry_price
+            FROM signal
+            WHERE end_time <= %s
+            ORDER BY end_time
+        """, (datetime.now(timezone.utc),))
+        
+        rows = cur.fetchall()
+        cur.close()
+        conn.close()
+        
+        return [
+            {
+                'asset': row[0],
+                'prediction': row[1],
+                'start_time': row[2],
+                'end_time': row[3],
+                'entry_price': float(row[4])
+            }
+            for row in rows
+        ]
+    except Exception as e:
+        logger.error(f"Failed to get active signals: {e}")
+        if conn:
+            conn.close()
+        return []
+
+def close_signal(asset, prediction, start_time, end_time, entry_price, exit_price):
+    """
+    Closes a signal by:
+    1. Calculating outcome and PnL
+    2. Saving to signal_history
+    3. Removing from active signals
+    """
+    conn = get_db_connection()
+    if not conn:
+        return
+    
+    try:
+        # Calculate PnL
+        if prediction == "LONG":
+            pnl_percent = ((exit_price - entry_price) / entry_price) * 100
+        elif prediction == "SHORT":
+            pnl_percent = ((entry_price - exit_price) / entry_price) * 100
+        else:  # NEUTRAL
+            pnl_percent = 0.0
+        
+        # Determine outcome
+        if pnl_percent > 0:
+            outcome = "WIN"
+        elif pnl_percent < 0:
+            outcome = "LOSS"
+        else:
+            outcome = "BREAKEVEN"
+        
+        cur = conn.cursor()
+        
+        # Insert into history
+        cur.execute("""
+            INSERT INTO signal_history 
+            (asset, prediction, start_time, end_time, entry_price, exit_price, outcome, pnl_percent)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+        """, (asset, prediction, start_time, end_time, entry_price, exit_price, outcome, pnl_percent))
+        
+        # Remove from active signals
+        cur.execute("DELETE FROM signal WHERE asset = %s", (asset,))
+        
+        conn.commit()
+        cur.close()
+        conn.close()
+        
+        # Log with visual indicator
+        outcome_icon = "✅" if outcome == "WIN" else "❌" if outcome == "LOSS" else "➖"
+        logger.info(f"Signal Closed: {asset} | {prediction} | PnL: {pnl_percent:+.2f}% | {outcome} {outcome_icon}")
+        
+    except Exception as e:
+        logger.error(f"Failed to close signal for {asset}: {e}")
+        if conn:
+            conn.close()
+
+def get_current_price(symbol, exchange):
+    """Fetches current price for an asset"""
+    try:
+        ticker = exchange.fetch_ticker(symbol)
+        return ticker['last']
+    except Exception as e:
+        logger.error(f"Failed to get price for {symbol}: {e}")
+        return None
+
+def process_expired_signals(exchange):
+    """
+    Checks for signals that have reached their end_time and closes them.
+    """
+    active_signals = get_active_signals()
+    
+    if not active_signals:
+        return
+    
+    logger.info(f"Processing {len(active_signals)} expired signals...")
+    
+    for signal in active_signals:
+        exit_price = get_current_price(signal['asset'], exchange)
+        
+        if exit_price:
+            close_signal(
+                asset=signal['asset'],
+                prediction=signal['prediction'],
+                start_time=signal['start_time'],
+                end_time=signal['end_time'],
+                entry_price=signal['entry_price'],
+                exit_price=exit_price
+            )
+            time.sleep(REQUEST_DELAY)
 
 # --- DATA & MODEL FUNCTIONS ---
 
@@ -355,18 +503,20 @@ def run_backtest_inference(df, model_data):
 def run_single_asset_live(symbol, anchor_price, model_data, exchange):
     """
     Performs a single live prediction for ONE asset.
-    Returns prediction_string
+    Returns (prediction_string, current_price)
     """
     configs = model_data['ensemble_configs']
     
     try:
         live_ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=50)
+        ticker = exchange.fetch_ticker(symbol)
+        current_price = ticker['last']
     except Exception as e:
         logger.error(f"Failed to fetch live data for {symbol}: {e}")
-        return "ERROR"
+        return "ERROR", None
 
     if not live_ohlcv:
-        return "ERROR"
+        return "ERROR", None
 
     live_df = pd.DataFrame(live_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     live_df['timestamp'] = pd.to_datetime(live_df['timestamp'], unit='ms', utc=True)
@@ -375,7 +525,7 @@ def run_single_asset_live(symbol, anchor_price, model_data, exchange):
     live_df = live_df.iloc[:-1] 
     
     if live_df.empty:
-        return "ERROR"
+        return "ERROR", None
     
     prices = live_df['close'].to_numpy()
     log_prices = np.log(prices / anchor_price)
@@ -405,11 +555,11 @@ def run_single_asset_live(symbol, anchor_price, model_data, exchange):
                 down_votes += 1
     
     if up_votes > 0 and down_votes == 0:
-        return "LONG"
+        return "LONG", current_price
     elif down_votes > 0 and up_votes == 0:
-        return "SHORT"
+        return "SHORT", current_price
     else:
-        return "NEUTRAL"
+        return "NEUTRAL", current_price
 
 def start_multi_asset_loop(loaded_models, anchor_prices):
     """
@@ -431,6 +581,9 @@ def start_multi_asset_loop(loaded_models, anchor_prices):
             logger.info(f"ITERATION {iteration} - {now_utc.strftime('%Y-%m-%d %H:%M:%S UTC')}")
             logger.info(f"{'='*50}")
             
+            # First, process any expired signals
+            process_expired_signals(exchange)
+            
             predictions_made = 0
             
             for symbol, model_data in loaded_models.items():
@@ -439,7 +592,7 @@ def start_multi_asset_loop(loaded_models, anchor_prices):
                     logger.warning(f"Skipping {symbol} - no anchor price")
                     continue
                 
-                pred = run_single_asset_live(symbol, anchor, model_data, exchange)
+                pred, entry_price = run_single_asset_live(symbol, anchor, model_data, exchange)
                 
                 # Console output with emoji
                 icon = "⚪"
@@ -450,11 +603,11 @@ def start_multi_asset_loop(loaded_models, anchor_prices):
                 elif pred == "ERROR":
                     icon = "⚠️"
                 
-                logger.info(f"{symbol:12} | {pred:8} {icon}")
+                logger.info(f"{symbol:12} | {pred:8} {icon} | Entry: ${entry_price:.4f}" if entry_price else f"{symbol:12} | {pred:8} {icon}")
                 
                 # Save to DB
-                if pred != "ERROR":
-                    save_prediction_to_db(symbol, pred, start_time, end_time)
+                if pred != "ERROR" and entry_price:
+                    save_prediction_to_db(symbol, pred, start_time, end_time, entry_price)
                     predictions_made += 1
                 
                 # Rate limiting
