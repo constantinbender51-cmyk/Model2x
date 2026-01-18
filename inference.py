@@ -87,9 +87,7 @@ def init_db():
                     asset TEXT PRIMARY KEY,
                     prediction TEXT,
                     start_time TIMESTAMP,
-                    end_time TIMESTAMP,
-                    confidence FLOAT,
-                    last_updated TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    end_time TIMESTAMP
                 );
             """)
             conn.commit()
@@ -101,31 +99,28 @@ def init_db():
             if conn:
                 conn.close()
 
-def save_prediction_to_db(asset, prediction, start_time, end_time, confidence=0.0):
+def save_prediction_to_db(asset, prediction, start_time, end_time):
     """
     Saves the prediction using Upsert (ON CONFLICT).
-    Added confidence score for prediction strength.
     """
     conn = get_db_connection()
     if conn:
         try:
             cur = conn.cursor()
             query = """
-                INSERT INTO signal (asset, prediction, start_time, end_time, confidence, last_updated)
-                VALUES (%s, %s, %s, %s, %s, CURRENT_TIMESTAMP)
+                INSERT INTO signal (asset, prediction, start_time, end_time)
+                VALUES (%s, %s, %s, %s)
                 ON CONFLICT (asset) 
                 DO UPDATE SET 
                     prediction = EXCLUDED.prediction,
                     start_time = EXCLUDED.start_time,
-                    end_time = EXCLUDED.end_time,
-                    confidence = EXCLUDED.confidence,
-                    last_updated = CURRENT_TIMESTAMP;
+                    end_time = EXCLUDED.end_time;
             """
-            cur.execute(query, (asset, prediction, start_time, end_time, confidence))
+            cur.execute(query, (asset, prediction, start_time, end_time))
             conn.commit()
             cur.close()
             conn.close()
-            logger.info(f"Saved to DB: {asset} -> {prediction} (confidence: {confidence:.2f})")
+            logger.info(f"Saved to DB: {asset} -> {prediction}")
         except Exception as e:
             logger.error(f"Failed to save prediction for {asset}: {e}")
             if conn:
@@ -360,7 +355,7 @@ def run_backtest_inference(df, model_data):
 def run_single_asset_live(symbol, anchor_price, model_data, exchange):
     """
     Performs a single live prediction for ONE asset.
-    Returns (prediction_string, confidence_score)
+    Returns prediction_string
     """
     configs = model_data['ensemble_configs']
     
@@ -368,10 +363,10 @@ def run_single_asset_live(symbol, anchor_price, model_data, exchange):
         live_ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=50)
     except Exception as e:
         logger.error(f"Failed to fetch live data for {symbol}: {e}")
-        return "ERROR", 0.0
+        return "ERROR"
 
     if not live_ohlcv:
-        return "ERROR", 0.0
+        return "ERROR"
 
     live_df = pd.DataFrame(live_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     live_df['timestamp'] = pd.to_datetime(live_df['timestamp'], unit='ms', utc=True)
@@ -380,13 +375,13 @@ def run_single_asset_live(symbol, anchor_price, model_data, exchange):
     live_df = live_df.iloc[:-1] 
     
     if live_df.empty:
-        return "ERROR", 0.0
+        return "ERROR"
     
     prices = live_df['close'].to_numpy()
     log_prices = np.log(prices / anchor_price)
     
-    up_voters = []
-    down_voters = []
+    up_votes = 0
+    down_votes = 0
     
     for cfg in configs:
         step_size = cfg['step_size']
@@ -405,21 +400,16 @@ def run_single_asset_live(symbol, anchor_price, model_data, exchange):
             diff = predicted_level - current_level
             
             if diff > 0:
-                up_voters.append(cfg)
+                up_votes += 1
             elif diff < 0:
-                down_voters.append(cfg)
+                down_votes += 1
     
-    # Calculate confidence based on voter agreement
-    total_voters = len(up_voters) + len(down_voters)
-    
-    if len(up_voters) > 0 and len(down_voters) == 0:
-        confidence = (len(up_voters) / max(len(configs), 1)) * 100
-        return "LONG", confidence
-    elif len(down_voters) > 0 and len(up_voters) == 0:
-        confidence = (len(down_voters) / max(len(configs), 1)) * 100
-        return "SHORT", confidence
+    if up_votes > 0 and down_votes == 0:
+        return "LONG"
+    elif down_votes > 0 and up_votes == 0:
+        return "SHORT"
     else:
-        return "NEUTRAL", 0.0
+        return "NEUTRAL"
 
 def start_multi_asset_loop(loaded_models, anchor_prices):
     """
@@ -449,7 +439,7 @@ def start_multi_asset_loop(loaded_models, anchor_prices):
                     logger.warning(f"Skipping {symbol} - no anchor price")
                     continue
                 
-                pred, confidence = run_single_asset_live(symbol, anchor, model_data, exchange)
+                pred = run_single_asset_live(symbol, anchor, model_data, exchange)
                 
                 # Console output with emoji
                 icon = "⚪"
@@ -460,11 +450,11 @@ def start_multi_asset_loop(loaded_models, anchor_prices):
                 elif pred == "ERROR":
                     icon = "⚠️"
                 
-                logger.info(f"{symbol:12} | {pred:8} {icon} | Confidence: {confidence:5.1f}%")
+                logger.info(f"{symbol:12} | {pred:8} {icon}")
                 
                 # Save to DB
                 if pred != "ERROR":
-                    save_prediction_to_db(symbol, pred, start_time, end_time, confidence)
+                    save_prediction_to_db(symbol, pred, start_time, end_time)
                     predictions_made += 1
                 
                 # Rate limiting
