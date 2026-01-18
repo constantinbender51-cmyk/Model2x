@@ -83,14 +83,13 @@ def init_db():
         try:
             cur = conn.cursor()
             
-            # Current signals table
+            # Current signals table (keep original structure)
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS signal (
                     asset TEXT PRIMARY KEY,
                     prediction TEXT,
                     start_time TIMESTAMP,
-                    end_time TIMESTAMP,
-                    entry_price NUMERIC
+                    end_time TIMESTAMP
                 );
             """)
             
@@ -106,10 +105,19 @@ def init_db():
                     exit_price NUMERIC NOT NULL,
                     outcome TEXT NOT NULL,
                     pnl_percent NUMERIC NOT NULL,
-                    completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    INDEX idx_asset_time (asset, completed_at),
-                    INDEX idx_outcome (outcome)
+                    completed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 );
+            """)
+            
+            # Create indexes if they don't exist
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_asset_time 
+                ON signal_history (asset, completed_at);
+            """)
+            
+            cur.execute("""
+                CREATE INDEX IF NOT EXISTS idx_outcome 
+                ON signal_history (outcome);
             """)
             
             conn.commit()
@@ -121,7 +129,7 @@ def init_db():
             if conn:
                 conn.close()
 
-def save_prediction_to_db(asset, prediction, start_time, end_time, entry_price):
+def save_prediction_to_db(asset, prediction, start_time, end_time):
     """
     Saves the prediction using Upsert (ON CONFLICT).
     """
@@ -130,16 +138,15 @@ def save_prediction_to_db(asset, prediction, start_time, end_time, entry_price):
         try:
             cur = conn.cursor()
             query = """
-                INSERT INTO signal (asset, prediction, start_time, end_time, entry_price)
-                VALUES (%s, %s, %s, %s, %s)
+                INSERT INTO signal (asset, prediction, start_time, end_time)
+                VALUES (%s, %s, %s, %s)
                 ON CONFLICT (asset) 
                 DO UPDATE SET 
                     prediction = EXCLUDED.prediction,
                     start_time = EXCLUDED.start_time,
-                    end_time = EXCLUDED.end_time,
-                    entry_price = EXCLUDED.entry_price;
+                    end_time = EXCLUDED.end_time;
             """
-            cur.execute(query, (asset, prediction, start_time, end_time, entry_price))
+            cur.execute(query, (asset, prediction, start_time, end_time))
             conn.commit()
             cur.close()
             conn.close()
@@ -161,7 +168,7 @@ def get_active_signals():
     try:
         cur = conn.cursor()
         cur.execute("""
-            SELECT asset, prediction, start_time, end_time, entry_price
+            SELECT asset, prediction, start_time, end_time
             FROM signal
             WHERE end_time <= %s
             ORDER BY end_time
@@ -176,8 +183,7 @@ def get_active_signals():
                 'asset': row[0],
                 'prediction': row[1],
                 'start_time': row[2],
-                'end_time': row[3],
-                'entry_price': float(row[4])
+                'end_time': row[3]
             }
             for row in rows
         ]
@@ -208,9 +214,9 @@ def close_signal(asset, prediction, start_time, end_time, entry_price, exit_pric
             pnl_percent = 0.0
         
         # Determine outcome
-        if pnl_percent > 0:
+        if pnl_percent > 0.1:  # Small threshold to avoid rounding issues
             outcome = "WIN"
-        elif pnl_percent < 0:
+        elif pnl_percent < -0.1:
             outcome = "LOSS"
         else:
             outcome = "BREAKEVEN"
@@ -252,6 +258,7 @@ def get_current_price(symbol, exchange):
 def process_expired_signals(exchange):
     """
     Checks for signals that have reached their end_time and closes them.
+    Fetches entry price from when signal was created.
     """
     active_signals = get_active_signals()
     
@@ -261,18 +268,37 @@ def process_expired_signals(exchange):
     logger.info(f"Processing {len(active_signals)} expired signals...")
     
     for signal in active_signals:
+        # Get both entry and exit prices
         exit_price = get_current_price(signal['asset'], exchange)
         
-        if exit_price:
-            close_signal(
-                asset=signal['asset'],
-                prediction=signal['prediction'],
-                start_time=signal['start_time'],
-                end_time=signal['end_time'],
-                entry_price=signal['entry_price'],
-                exit_price=exit_price
-            )
-            time.sleep(REQUEST_DELAY)
+        if not exit_price:
+            logger.warning(f"Could not get exit price for {signal['asset']}, skipping")
+            continue
+            
+        # Fetch entry price from start_time
+        try:
+            # Get the candle at start_time
+            start_ts = int(signal['start_time'].timestamp() * 1000)
+            ohlcv = exchange.fetch_ohlcv(signal['asset'], TIMEFRAME, since=start_ts, limit=1)
+            
+            if ohlcv and len(ohlcv) > 0:
+                entry_price = ohlcv[0][4]  # Close price of the entry candle
+                
+                close_signal(
+                    asset=signal['asset'],
+                    prediction=signal['prediction'],
+                    start_time=signal['start_time'],
+                    end_time=signal['end_time'],
+                    entry_price=entry_price,
+                    exit_price=exit_price
+                )
+            else:
+                logger.warning(f"Could not fetch entry candle for {signal['asset']}, skipping")
+                
+        except Exception as e:
+            logger.error(f"Error processing signal for {signal['asset']}: {e}")
+            
+        time.sleep(REQUEST_DELAY)
 
 # --- DATA & MODEL FUNCTIONS ---
 
@@ -603,11 +629,11 @@ def start_multi_asset_loop(loaded_models, anchor_prices):
                 elif pred == "ERROR":
                     icon = "⚠️"
                 
-                logger.info(f"{symbol:12} | {pred:8} {icon} | Entry: ${entry_price:.4f}" if entry_price else f"{symbol:12} | {pred:8} {icon}")
+                logger.info(f"{symbol:12} | {pred:8} {icon}")
                 
                 # Save to DB
-                if pred != "ERROR" and entry_price:
-                    save_prediction_to_db(symbol, pred, start_time, end_time, entry_price)
+                if pred != "ERROR":
+                    save_prediction_to_db(symbol, pred, start_time, end_time)
                     predictions_made += 1
                 
                 # Rate limiting
