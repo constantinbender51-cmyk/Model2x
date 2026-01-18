@@ -13,22 +13,8 @@ from dotenv import load_dotenv
 
 # --- CONFIGURATION ---
 
-# IMPORTANT: Update these timeframes to match the "WINNER" output from your training script.
-# The training script selects different timeframes for different assets.
-ASSET_CONFIGS = {
-    'BTC/USDT': {'timeframe': '30m'}, 
-    'ETH/USDT': {'timeframe': '30m'},
-    'BNB/USDT': {'timeframe': '30m'},
-    'SOL/USDT': {'timeframe': '30m'},
-    'XRP/USDT': {'timeframe': '30m'}
-}
-
-# If an asset isn't in the specific list above, use this:
-DEFAULT_TIMEFRAME = '30m'
-
-# Training Data Parameters (Must match training script defaults to validate correctly)
-START_DATE = '2020-01-01T00:00:00Z'
-END_DATE = '2026-01-01T00:00:00Z'
+# Assets to look for (Must match the assets trained in the training script)
+TARGET_ASSETS = ['BTC/USDT', 'ETH/USDT', 'BNB/USDT', 'SOL/USDT', 'XRP/USDT']
 
 # Railway / Database Configuration
 load_dotenv()
@@ -39,9 +25,8 @@ DATA_DIR = "/app/data"
 HF_REPO_ID = "Llama26051996/Models" 
 HF_FOLDER = "model2x"
 
-# Pass Criteria
-TARGET_ACCURACY = 75.0 
-ACCURACY_TOLERANCE = 5.0
+# Validation Criteria
+TARGET_ACCURACY = 70.0  # Matches training threshold
 
 def ensure_directories():
     if not os.path.exists(DATA_DIR):
@@ -105,9 +90,6 @@ def save_prediction_to_db(asset, prediction, start_time, end_time):
 
 # --- HELPER FUNCTIONS ---
 
-def get_timeframe(symbol):
-    return ASSET_CONFIGS.get(symbol, {}).get('timeframe', DEFAULT_TIMEFRAME)
-
 def get_model_filename(symbol):
     return f"{symbol.split('/')[0].lower()}.pkl"
 
@@ -119,21 +101,27 @@ def get_grid_indices_from_price(prices, initial_price, step_size):
     """
     Calculates grid indices based on log-distance from the initial_price.
     Formula: floor( ln(price / initial_price) / step_size )
+    Matches the Numba logic from training script.
     """
-    # prices can be a single float or a numpy array
-    if isinstance(prices, pd.Series) or isinstance(prices, list):
+    if isinstance(prices, (pd.Series, list)):
         prices = np.array(prices)
         
+    # Prevent log(0) errors
+    prices = np.maximum(prices, 1e-9)
+    
     log_dist = np.log(prices / initial_price)
     return np.floor(log_dist / step_size).astype(int)
 
-# --- DATA LOADING ---
+# --- MODEL LOADING ---
 
 def download_models():
-    print(f"\n[MODEL] Checking models for: {list(ASSET_CONFIGS.keys())}")
+    """
+    Downloads models for TARGET_ASSETS from Hugging Face.
+    """
+    print(f"\n[MODEL] Checking models for: {TARGET_ASSETS}")
     model_paths = {}
     
-    for symbol in ASSET_CONFIGS.keys():
+    for symbol in TARGET_ASSETS:
         fname = get_model_filename(symbol)
         try:
             print(f"[MODEL] Downloading {fname}...", end='\r')
@@ -152,6 +140,10 @@ def download_models():
     return model_paths
 
 def load_all_models(model_paths_dict):
+    """
+    Loads pickle files and validates schema.
+    CRITICAL: Extracts the 'timeframe' determined during training.
+    """
     loaded_models = {}
     print(f"[INFERENCE] Loading model files...")
     
@@ -160,123 +152,20 @@ def load_all_models(model_paths_dict):
             with open(path, 'rb') as f:
                 data = pickle.load(f)
                 
-            # Verify new structure
-            if 'ensemble_configs' not in data or 'initial_price' not in data:
-                print(f"[ERROR] {symbol} model file has invalid/old format.")
+            # Verify structure and compatibility
+            required_keys = ['ensemble_configs', 'initial_price', 'timeframe']
+            if any(k not in data for k in required_keys):
+                print(f"[ERROR] {symbol} model file is missing keys. Please re-train.")
                 continue
                 
             loaded_models[symbol] = data
-            print(f" -> Loaded {symbol} (Base Price: {data['initial_price']:.4f})")
+            print(f" -> Loaded {symbol} | Timeframe: {data['timeframe']} | Base Price: {data['initial_price']:.4f}")
         except Exception as e:
             print(f"[ERROR] Could not load pickle for {symbol}: {e}")
             
     return loaded_models
 
-def fetch_historical_validation_data(symbol):
-    """Fetches full history for backtest validation only."""
-    ensure_directories()
-    timeframe = get_timeframe(symbol)
-    data_file = get_data_filename(symbol, timeframe)
-    
-    # Try local cache first
-    if os.path.exists(data_file):
-        try:
-            df = pd.read_pickle(data_file)
-            return df
-        except: pass
-
-    print(f"[DATA] Fetching history for {symbol} [{timeframe}]...")
-    exchange = ccxt.binance({'enableRateLimit': True})
-    since = exchange.parse8601(START_DATE)
-    end_ts = exchange.parse8601(END_DATE)
-    all_ohlcv = []
-
-    while since < end_ts:
-        try:
-            ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since, limit=1000)
-            if not ohlcv: break
-            all_ohlcv.extend(ohlcv)
-            since = ohlcv[-1][0] + 1
-            if since >= end_ts: break
-            time.sleep(exchange.rateLimit / 1000 * 1.05)
-        except Exception: break
-
-    if not all_ohlcv: return pd.DataFrame()
-
-    df = pd.DataFrame(all_ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms', utc=True)
-    
-    # Filter range
-    start_dt = pd.Timestamp(START_DATE, tz='UTC')
-    end_dt = pd.Timestamp(END_DATE, tz='UTC')
-    df = df.loc[(df['timestamp'] >= start_dt) & (df['timestamp'] < end_dt)].reset_index(drop=True)
-
-    df.to_pickle(data_file)
-    return df
-
-# --- INFERENCE ENGINES ---
-
-def run_backtest_validation(symbol, df, model_data):
-    """
-    Validates the loaded model against historical data to ensure integrity.
-    """
-    configs = model_data['ensemble_configs']
-    initial_price = model_data['initial_price']
-    
-    close_prices = df['close'].to_numpy()
-    total_len = len(close_prices)
-    idx_80 = int(total_len * 0.80)
-    idx_90 = int(total_len * 0.90)
-    
-    # Pre-compute grids for each config
-    config_grids = []
-    for cfg in configs:
-        grid = get_grid_indices_from_price(close_prices, initial_price, cfg['step_size'])
-        config_grids.append({'cfg': cfg, 'full_grid': grid})
-
-    correct = 0
-    total_trades = 0
-    
-    # Simulate the validation period used in training (80% to 90%)
-    for i in range(idx_80, idx_90):
-        up_votes = 0
-        down_votes = 0
-        
-        for item in config_grids:
-            cfg = item['cfg']
-            grid = item['full_grid']
-            seq_len = cfg['seq_len']
-            
-            # Form sequence ending at i-1 to predict i
-            if i <= seq_len: continue
-            
-            seq_tuple = tuple(grid[i - seq_len : i])
-            current_level = seq_tuple[-1]
-            
-            if seq_tuple in cfg['patterns']:
-                history = cfg['patterns'][seq_tuple]
-                predicted_level = Counter(history).most_common(1)[0][0]
-                diff = predicted_level - current_level
-                
-                if diff > 0: up_votes += 1
-                elif diff < 0: down_votes += 1
-        
-        prediction = 0
-        if up_votes > 0 and down_votes == 0:
-            prediction = 1 # LONG
-        elif down_votes > 0 and up_votes == 0:
-            prediction = -1 # SHORT
-            
-        if prediction != 0:
-            actual_next_price = close_prices[i]
-            prev_price = close_prices[i-1]
-            
-            if prediction == 1 and actual_next_price > prev_price: correct += 1
-            elif prediction == -1 and actual_next_price < prev_price: correct += 1
-            total_trades += 1
-
-    acc = (correct / total_trades * 100) if total_trades > 0 else 0.0
-    return acc, total_trades
+# --- INFERENCE ENGINE ---
 
 def run_live_inference(symbol, exchange, model_data):
     """
@@ -284,7 +173,9 @@ def run_live_inference(symbol, exchange, model_data):
     """
     configs = model_data['ensemble_configs']
     initial_price = model_data['initial_price']
-    timeframe = get_timeframe(symbol)
+    
+    # DYNAMIC TIMEFRAME: Use the one saved in the model
+    timeframe = model_data['timeframe']
     
     # Determine max sequence length needed + buffer
     max_seq_len = max(c['seq_len'] for c in configs)
@@ -304,10 +195,13 @@ def run_live_inference(symbol, exchange, model_data):
     # Drop the last incomplete candle to prevent repainting
     df = df.iloc[:-1]
     
+    if df.empty: return "ERROR"
+
     current_prices = df['close'].to_numpy()
     up_votes = 0
     down_votes = 0
     
+    # Iterate through all ensemble configurations
     for cfg in configs:
         step_size = cfg['step_size']
         seq_len = cfg['seq_len']
@@ -321,14 +215,17 @@ def run_live_inference(symbol, exchange, model_data):
         current_seq = tuple(grid[-seq_len:])
         current_level = current_seq[-1]
         
+        # Check against trained patterns
         if current_seq in cfg['patterns']:
             history = cfg['patterns'][current_seq]
-            predicted_level = Counter(history).most_common(1)[0][0]
+            # Predict most common outcome
+            predicted_level = max(history, key=history.get)
             diff = predicted_level - current_level
             
             if diff > 0: up_votes += 1
             elif diff < 0: down_votes += 1
             
+    # Ensemble Consensus Logic
     if up_votes > 0 and down_votes == 0:
         return "LONG"
     elif down_votes > 0 and up_votes == 0:
@@ -340,19 +237,18 @@ def run_live_inference(symbol, exchange, model_data):
 
 def start_bot(valid_models):
     exchange = ccxt.binance({'enableRateLimit': True})
-    print(f"\n[SYSTEM] Starting Live Bot for: {list(valid_models.keys())}")
+    print(f"\n[SYSTEM] Starting Live Bot...")
     
-    # We store the timestamp of the last candle we successfully traded/checked per symbol
+    # We store the timestamp of the last candle we successfully processed per symbol
     last_processed = {} 
     
     while True:
         try:
-            # Wake up every ~10s to be responsive, but only act on new candles.
-            
             for symbol, model_data in valid_models.items():
-                timeframe = get_timeframe(symbol)
+                # DYNAMIC TIMEFRAME: Read strictly from model
+                timeframe = model_data['timeframe']
                 
-                # A. Fetch very minimal data to check timestamps (3 candles is plenty)
+                # A. Fetch very minimal data to check timestamps
                 try:
                     ohlcv = exchange.fetch_ohlcv(symbol, timeframe, limit=3)
                 except Exception as e:
@@ -377,7 +273,6 @@ def start_bot(valid_models):
                     print(f"\n[{human_time}] New {timeframe} candle for {symbol}...")
                     
                     # 1. Run Inference
-                    # (We fetch slightly more data inside run_live_inference for actual calc)
                     pred = run_live_inference(symbol, exchange, model_data)
                     
                     # 2. Log & Save
@@ -387,11 +282,12 @@ def start_bot(valid_models):
                     
                     print(f"   >>> SIGNAL: {pred} {icon}")
                     
-                    if pred != "ERROR":
+                    if pred not in ["ERROR", "NEUTRAL"]:
                         # Set signal validity
                         start_time = datetime.now(timezone.utc)
-                        # Estimate end time based on timeframe string
-                        duration_min = 1
+                        
+                        # Estimate end time based on timeframe string for database log
+                        duration_min = 30 # Default
                         if 'h' in timeframe: duration_min = int(timeframe.strip('h')) * 60
                         elif 'm' in timeframe: duration_min = int(timeframe.strip('m'))
                         
@@ -402,11 +298,10 @@ def start_bot(valid_models):
                     last_processed[symbol] = last_closed_ts
                     
                 else:
-                    # We have already processed this candle.
+                    # Candle already processed
                     pass
 
-            # Sleep short enough to catch 1m candles quickly, 
-            # but long enough to not spam API unnecessarily.
+            # Sleep to prevent rate limit issues but stay responsive
             time.sleep(10) 
             
         except KeyboardInterrupt:
@@ -420,42 +315,21 @@ def main():
     init_db()
     ensure_directories()
     
-    # 1. Load Models
+    # 1. Download Models
     model_paths = download_models()
-    if not model_paths: return
+    if not model_paths:
+        print("[ERROR] No models downloaded. Exiting.")
+        return
     
+    # 2. Load Models & Configs
+    # (This now automatically gets the correct 'timeframe' from the pickle)
     loaded_models = load_all_models(model_paths)
-    if not loaded_models: return
+    if not loaded_models:
+        print("[ERROR] No valid models loaded. Exiting.")
+        return
 
-    # 2. Validate Models (Optional but recommended sanity check)
-    valid_models = {}
-    print(f"\n--- VALIDATION STAGE ---")
-    for symbol, model_data in loaded_models.items():
-        try:
-            df = fetch_historical_validation_data(symbol)
-            if not df.empty:
-                # Sanity Check
-                first_price = df['close'].iloc[0]
-                model_init = model_data['initial_price']
-                if abs(first_price - model_init)/model_init > 0.5:
-                     print(f"[WARN] {symbol} Data Mismatch! History Start: {first_price}, Model Base: {model_init}")
-                
-                acc, trades = run_backtest_validation(symbol, df, model_data)
-                status = "PASS ✅" if acc > (TARGET_ACCURACY - 10) else "WARN ⚠️"
-                print(f"{symbol}: Acc {acc:.2f}% ({trades} candles) - {status}")
-                valid_models[symbol] = model_data
-            else:
-                print(f"[WARN] Could not validate {symbol}, proceeding blindly.")
-                valid_models[symbol] = model_data
-        except Exception as e:
-            print(f"[ERROR] Validation error {symbol}: {e}")
-            valid_models[symbol] = model_data
-
-    # 3. Start Live
-    if valid_models:
-        start_bot(valid_models)
-    else:
-        print("No valid models to run.")
+    # 3. Start Live Bot
+    start_bot(loaded_models)
 
 if __name__ == "__main__":
     main()
