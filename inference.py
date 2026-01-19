@@ -80,7 +80,6 @@ def init_db():
     if conn:
         try:
             cur = conn.cursor()
-            # 1. Ensure tables exist
             cur.execute("""
                 CREATE TABLE IF NOT EXISTS signal (
                     asset TEXT PRIMARY KEY,
@@ -98,7 +97,6 @@ def init_db():
                     PRIMARY KEY (time, asset)
                 );
             """)
-            # 2. Migration: Rename outcome to pnl if the old column exists
             cur.execute("""
                 DO $$ 
                 BEGIN 
@@ -116,22 +114,15 @@ def init_db():
             logger.error(f"Failed to init DB: {e}")
 
 def settle_and_update_fast(asset, new_pred, p_market, entry_tracker):
-    """
-    1. Updates signal state with timestamps.
-    2. Calculates pnl from entry price (stored in json) and exit price.
-    """
     conn = get_db_connection()
     if not conn: return
     
     try:
         cur = conn.cursor()
-        
-        # Check previous prediction from DB
         cur.execute("SELECT prediction FROM signal WHERE asset = %s", (asset,))
         row = cur.fetchone()
         prev_pred_str = row[0] if row else None
         
-        # Calculate PNL if previous signal was valid and we have an entry price
         if prev_pred_str in ["LONG", "SHORT"] and asset in entry_tracker:
             p_entry = entry_tracker[asset]
             p_exit = p_market
@@ -142,12 +133,11 @@ def settle_and_update_fast(asset, new_pred, p_market, entry_tracker):
                 INSERT INTO signal_history (time, asset, prediction, pnl)
                 VALUES (CURRENT_TIMESTAMP, %s, %s, %s)
             """, (asset, prev_pred_str, pnl))
-            conn.commit() # Separate commit for history
+            conn.commit()
             
             icon = "✅" if pnl > 0 else "❌" if pnl < 0 else "➖"
             logger.info(f"{asset:12} | Exit: {p_exit:.4f} | PNL: {pnl:+.4f}% {icon}")
 
-        # Update Current Signal Table
         start_t = datetime.now(timezone.utc)
         end_t = start_t + timedelta(minutes=30)
         cur.execute("""
@@ -159,9 +149,8 @@ def settle_and_update_fast(asset, new_pred, p_market, entry_tracker):
                 start_time = EXCLUDED.start_time,
                 end_time = EXCLUDED.end_time;
         """, (asset, new_pred, start_t, end_t))
-        conn.commit() # Separate commit for signal update
+        conn.commit()
         
-        # Record NEW entry price locally
         entry_tracker[asset] = p_market
         save_entry_prices(entry_tracker)
         
@@ -202,39 +191,123 @@ def load_all_models(model_paths_dict):
             continue
     return loaded_models
 
+# --- CORE LOGIC (EXTRACTED) ---
+
+def predict_direction(close_prices, anchor_price, configs):
+    """
+    Pure function to predict direction based on price array.
+    Used by both live inference and backtest validation.
+    """
+    # Ensure numpy array
+    prices_arr = np.array(close_prices)
+    log_prices = np.log(prices_arr / anchor_price)
+    
+    up, down = 0, 0
+    for cfg in configs:
+        grid = np.floor(log_prices / cfg['step_size']).astype(int)
+        
+        # Ensure grid is long enough for the pattern sequence
+        if len(grid) < cfg['seq_len']: continue
+        
+        seq = tuple(grid[-cfg['seq_len']:])
+        if seq in cfg['patterns']:
+            pred_lvl = Counter(cfg['patterns'][seq]).most_common(1)[0][0]
+            if pred_lvl > seq[-1]: up += 1
+            elif pred_lvl < seq[-1]: down += 1
+            
+    return "LONG" if (up > 0 and down == 0) else "SHORT" if (down > 0 and up == 0) else "NEUTRAL"
+
+# --- VALIDATION LOGIC ---
+
+def validate_asset_accuracy(symbol, anchor_price, model_data, exchange):
+    """
+    Tests model on the last week of data (approx 336 candles for 30m).
+    Returns accuracy percentage (0-100).
+    """
+    logger.info(f"Running 1-week backtest validation for {symbol}...")
+    try:
+        # Fetch 500 candles to ensure we have full week + lookback buffer
+        ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=500)
+        if not ohlcv or len(ohlcv) < 350:
+            logger.warning(f"Insufficient history for {symbol} validation.")
+            return 0.0
+
+        # Create DataFrame
+        df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        closes = df['close'].values
+        
+        # We need to simulate the sliding window used in 'run_single_asset_live'
+        # Live uses limit=20, so window size is roughly 19 (excluding the 'current' forming candle)
+        window_size = 19
+        configs = model_data['ensemble_configs']
+        
+        correct = 0
+        total_trades = 0
+        
+        # Define validation range: Last 336 candles (1 week)
+        start_index = len(closes) - 336
+        if start_index < window_size: start_index = window_size
+        
+        # Iterate through the history
+        # 'i' represents the target candle we want to predict direction FOR
+        # We use data up to 'i-1' to predict 'i'
+        for i in range(start_index, len(closes)):
+            # Input window: previous 'window_size' candles up to i-1
+            input_series = closes[i - window_size : i]
+            
+            # Get prediction
+            pred = predict_direction(input_series, anchor_price, configs)
+            
+            # Determine actual outcome (Close[i] vs Close[i-1])
+            prev_close = closes[i-1]
+            curr_close = closes[i]
+            
+            if pred == "LONG":
+                total_trades += 1
+                if curr_close > prev_close:
+                    correct += 1
+            elif pred == "SHORT":
+                total_trades += 1
+                if curr_close < prev_close:
+                    correct += 1
+                    
+        if total_trades == 0:
+            logger.warning(f"{symbol}: No trades triggered in validation period.")
+            return 0.0
+            
+        accuracy = (correct / total_trades) * 100
+        logger.info(f"Validation Result {symbol}: {correct}/{total_trades} correct | Accuracy: {accuracy:.2f}%")
+        return accuracy
+
+    except Exception as e:
+        logger.error(f"Validation error for {symbol}: {e}")
+        return 0.0
+
+# --- LIVE FUNCTIONS ---
+
 def run_single_asset_live(symbol, anchor_price, model_data, exchange, debug=False):
-    configs = model_data['ensemble_configs']
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=20)
         if len(ohlcv) < 3: return "ERROR", None
         
         p_market = ohlcv[-2][4]  # Close of last completed candle
         
-        live_df = pd.DataFrame(ohlcv[:-1], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        # Use close prices excluding the currently forming candle (index -1)
+        # Matches logic: live_df = ohlcv[:-1]
+        close_prices = [x[4] for x in ohlcv[:-1]]
         
         # --- DEBUG PRINT ---
         if debug:
-            display_df = live_df.copy()
-            # Convert timestamp ms to readable date
-            display_df['timestamp'] = pd.to_datetime(display_df['timestamp'], unit='ms')
+            live_df = pd.DataFrame(ohlcv[:-1], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            live_df['timestamp'] = pd.to_datetime(live_df['timestamp'], unit='ms')
             logger.info(f"\n--- PREDICTION CANDLES FOR {symbol} ---")
-            logger.info(f"\n{display_df}")
+            logger.info(f"\n{live_df}")
             logger.info("---------------------------------------")
         # -------------------
 
-        log_prices = np.log(live_df['close'].to_numpy() / anchor_price)
+        # Use extracted core logic
+        res = predict_direction(close_prices, anchor_price, model_data['ensemble_configs'])
         
-        up, down = 0, 0
-        for cfg in configs:
-            grid = np.floor(log_prices / cfg['step_size']).astype(int)
-            if len(grid) < cfg['seq_len']: continue
-            seq = tuple(grid[-cfg['seq_len']:])
-            if seq in cfg['patterns']:
-                pred_lvl = Counter(cfg['patterns'][seq]).most_common(1)[0][0]
-                if pred_lvl > seq[-1]: up += 1
-                elif pred_lvl < seq[-1]: down += 1
-        
-        res = "LONG" if (up > 0 and down == 0) else "SHORT" if (down > 0 and up == 0) else "NEUTRAL"
         return res, p_market
     except Exception as e:
         logger.debug(f"Inference error for {symbol}: {e}")
@@ -247,14 +320,11 @@ def start_multi_asset_loop(loaded_models, anchor_prices):
     
     while True:
         try:
-            # Select 3 random symbols to print candles for this cycle
             all_symbols = list(loaded_models.keys())
             debug_symbols = random.sample(all_symbols, min(3, len(all_symbols)))
 
             for symbol, model_data in loaded_models.items():
                 anchor = anchor_prices.get(symbol)
-                
-                # Enable debug if this symbol was selected
                 is_debug = symbol in debug_symbols
                 
                 new_pred, p_market = run_single_asset_live(
@@ -297,19 +367,35 @@ def main():
     exchange = ccxt.binance({'enableRateLimit': True})
     
     validation_passed = True
+    
+    # --- UPDATED VALIDATION LOGIC ---
     for sym in test_symbols:
         anchor = loaded_models[sym]['initial_price']
+        
+        # 1. Check if live inference works technically
         pred, p_m = run_single_asset_live(sym, anchor, loaded_models[sym], exchange, debug=False)
         if pred == "ERROR":
+            logger.error(f"PRE-FLIGHT: {sym} Technical check failed.")
             validation_passed = False
             break
-        logger.info(f"PRE-FLIGHT: {sym} OK. Price: {p_m}")
+            
+        # 2. Check 1-Week Accuracy > 70%
+        accuracy = validate_asset_accuracy(sym, anchor, loaded_models[sym], exchange)
+        if accuracy <= 70.0:
+            logger.error(f"PRE-FLIGHT: {sym} failed accuracy threshold (Got {accuracy:.2f}%, Required > 70%).")
+            validation_passed = False
+            break
+        
+        logger.info(f"PRE-FLIGHT: {sym} OK. Accuracy: {accuracy:.2f}% | Live Price: {p_m}")
+    # --------------------------------
 
     if validation_passed:
+        logger.info(">>> ALL CHECKS PASSED. STARTING LIVE TRADING. <<<")
         anchors = {sym: loaded_models[sym]['initial_price'] for sym in loaded_models}
         start_multi_asset_loop(loaded_models, anchors)
     else:
         logger.error("System halted due to validation failure.")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
