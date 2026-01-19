@@ -202,7 +202,7 @@ def load_all_models(model_paths_dict):
             continue
     return loaded_models
 
-def run_single_asset_live(symbol, anchor_price, model_data, exchange):
+def run_single_asset_live(symbol, anchor_price, model_data, exchange, debug=False):
     configs = model_data['ensemble_configs']
     try:
         ohlcv = exchange.fetch_ohlcv(symbol, TIMEFRAME, limit=20)
@@ -211,6 +211,17 @@ def run_single_asset_live(symbol, anchor_price, model_data, exchange):
         p_market = ohlcv[-2][4]  # Close of last completed candle
         
         live_df = pd.DataFrame(ohlcv[:-1], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        
+        # --- DEBUG PRINT ---
+        if debug:
+            display_df = live_df.copy()
+            # Convert timestamp ms to readable date
+            display_df['timestamp'] = pd.to_datetime(display_df['timestamp'], unit='ms')
+            logger.info(f"\n--- PREDICTION CANDLES FOR {symbol} ---")
+            logger.info(f"\n{display_df}")
+            logger.info("---------------------------------------")
+        # -------------------
+
         log_prices = np.log(live_df['close'].to_numpy() / anchor_price)
         
         up, down = 0, 0
@@ -236,9 +247,23 @@ def start_multi_asset_loop(loaded_models, anchor_prices):
     
     while True:
         try:
+            # Select 3 random symbols to print candles for this cycle
+            all_symbols = list(loaded_models.keys())
+            debug_symbols = random.sample(all_symbols, min(3, len(all_symbols)))
+
             for symbol, model_data in loaded_models.items():
                 anchor = anchor_prices.get(symbol)
-                new_pred, p_market = run_single_asset_live(symbol, anchor, model_data, exchange)
+                
+                # Enable debug if this symbol was selected
+                is_debug = symbol in debug_symbols
+                
+                new_pred, p_market = run_single_asset_live(
+                    symbol, 
+                    anchor, 
+                    model_data, 
+                    exchange, 
+                    debug=is_debug
+                )
                 
                 if new_pred != "ERROR":
                     settle_and_update_fast(symbol, new_pred, p_market, entry_tracker)
@@ -274,7 +299,7 @@ def main():
     validation_passed = True
     for sym in test_symbols:
         anchor = loaded_models[sym]['initial_price']
-        pred, p_m = run_single_asset_live(sym, anchor, loaded_models[sym], exchange)
+        pred, p_m = run_single_asset_live(sym, anchor, loaded_models[sym], exchange, debug=False)
         if pred == "ERROR":
             validation_passed = False
             break
